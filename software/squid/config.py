@@ -1,6 +1,6 @@
 import enum
 import math
-from typing import Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import pydantic
 
@@ -14,6 +14,7 @@ class FilterWheelControllerVariant(enum.Enum):
     OPTOSPIN = "OPTOSPIN"
     DRAGONFLY = "DRAGONFLY"
     XLIGHT = "XLIGHT"
+    ZWO = "ZWO"
 
     @staticmethod
     def from_string(filter_wheel_controller_string: str) -> Optional["FilterWheelControllerVariant"]:
@@ -54,6 +55,15 @@ class OptospinFilterWheelConfig(pydantic.BaseModel):
     ttl_trigger: bool
 
 
+class ZWOFilterWheelConfig(pydantic.BaseModel):
+    """Configuration for ZWO EFW filter wheel controller."""
+
+    sdk_id: Optional[int] = None  # Specific SDK ID to use (None = auto-detect first available)
+    delay_ms: float = 0.0  # Delay after position change in milliseconds (non-blocking mode)
+    blocking: bool = True  # If True, wait for movement to complete; if False, use delay_ms
+    slot_names: Optional[List[str]] = None  # Optional custom names for filter slots
+
+
 class FilterWheelConfig(pydantic.BaseModel):
     """
     Configuration for filter wheel controller system.
@@ -66,7 +76,7 @@ class FilterWheelConfig(pydantic.BaseModel):
     indices: list[int]
 
     # Controller-specific configuration
-    controller_config: Optional[Union[SquidFilterWheelConfig, ZaberFilterWheelConfig, OptospinFilterWheelConfig]] = None
+    controller_config: Optional[Union[SquidFilterWheelConfig, ZaberFilterWheelConfig, OptospinFilterWheelConfig, ZWOFilterWheelConfig]] = None
 
 
 def _load_filter_wheel_config() -> Optional[FilterWheelConfig]:
@@ -100,6 +110,18 @@ def _load_filter_wheel_config() -> Optional[FilterWheelConfig]:
             speed_hz=_def.OPTOSPIN_EMISSION_FILTER_WHEEL_SPEED_HZ,
             delay_ms=_def.OPTOSPIN_EMISSION_FILTER_WHEEL_DELAY_MS,
             ttl_trigger=_def.OPTOSPIN_EMISSION_FILTER_WHEEL_TTL_TRIGGER,
+        )
+    elif controller_type == FilterWheelControllerVariant.ZWO:
+        # Use defaults if not configured in _def.py
+        sdk_id = getattr(_def, "ZWO_EMISSION_FILTER_WHEEL_SDK_ID", None)
+        delay_ms = getattr(_def, "ZWO_EMISSION_FILTER_WHEEL_DELAY_MS", 0.0)
+        blocking = getattr(_def, "ZWO_EMISSION_FILTER_WHEEL_BLOCKING", True)
+        slot_names = getattr(_def, "ZWO_EMISSION_FILTER_WHEEL_SLOT_NAMES", None)
+        controller_config = ZWOFilterWheelConfig(
+            sdk_id=sdk_id,
+            delay_ms=delay_ms,
+            blocking=blocking,
+            slot_names=slot_names,
         )
 
     return FilterWheelConfig(

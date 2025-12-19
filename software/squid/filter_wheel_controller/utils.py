@@ -152,6 +152,7 @@ def get_filter_wheel_controller(
     from squid.filter_wheel_controller.cephla import SquidFilterWheel
     from squid.filter_wheel_controller.optospin import Optospin
     from squid.filter_wheel_controller.zaber import ZaberFilterController
+    from squid.filter_wheel_controller.zwo_efw import ZWOEFWController
 
     if config.controller_type == FilterWheelControllerVariant.SQUID:
         if microcontroller is None:
@@ -163,6 +164,9 @@ def get_filter_wheel_controller(
 
     elif config.controller_type == FilterWheelControllerVariant.OPTOSPIN:
         return Optospin(config=config.controller_config)
+
+    elif config.controller_type == FilterWheelControllerVariant.ZWO:
+        return ZWOEFWController(config=config.controller_config)
 
     else:
         raise ValueError(f"Unknown or unsupported filter wheel controller type: {config.controller_type}")
