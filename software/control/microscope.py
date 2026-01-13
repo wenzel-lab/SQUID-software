@@ -4,10 +4,8 @@ from typing import Optional
 import numpy as np
 
 import control._def
-from control.core.channel_configuration_mananger import ChannelConfigurationManager
-from control.core.configuration_mananger import ConfigurationManager
+from control.core.config import ConfigRepository
 from control.core.contrast_manager import ContrastManager
-from control.core.laser_af_settings_manager import LaserAFSettingManager
 from control.core.live_controller import LiveController
 from control.core.objective_store import ObjectiveStore
 from control.core.stream_handler import StreamHandler, StreamHandlerFunctions, NoOpStreamHandlerFunctions
@@ -319,27 +317,24 @@ class Microscope:
         self._simulated = simulated
 
         self.objective_store: ObjectiveStore = ObjectiveStore()
-        # Pass configurations path for loading global channel definitions
-        configurations_path = Path(__file__).parent.parent / "configurations"
-        self.channel_configuration_mananger: ChannelConfigurationManager = ChannelConfigurationManager(
-            configurations_path=configurations_path
-        )
-        # Migrate all profiles/objectives from XML to JSON (one-time operation)
-        migration_marker = control._def.ACQUISITION_CONFIGURATIONS_PATH / ".migration_complete"
-        if not migration_marker.exists():
-            self.channel_configuration_mananger.migrate_all_profiles(control._def.ACQUISITION_CONFIGURATIONS_PATH)
 
-        # Sync confocal mode from hardware (works in both GUI and headless modes)
-        if control._def.ENABLE_SPINNING_DISK_CONFOCAL:
-            self._sync_confocal_mode_from_hardware()
+        # Centralized config management
+        self.config_repo: ConfigRepository = ConfigRepository()
 
-        self.laser_af_settings_manager: Optional[LaserAFSettingManager] = None
-        if control._def.SUPPORT_LASER_AUTOFOCUS:
-            self.laser_af_settings_manager = LaserAFSettingManager()
+        # Note: Migration from acquisition_configurations to user_profiles is handled
+        # by run_auto_migration() in main_hcs.py before Microscope is created
 
-        self.configuration_mananger: ConfigurationManager = ConfigurationManager(
-            self.channel_configuration_mananger, self.laser_af_settings_manager
-        )
+        # Load default profile (ensures configs exist)
+        profiles = self.config_repo.get_available_profiles()
+        if profiles:
+            self.config_repo.load_profile(profiles[0])
+        else:
+            # Create a default profile if none exist - load_profile() will call
+            # ensure_default_configs() to generate configs from illumination_channel_config.yaml
+            self._log.info("No profiles found, creating 'default' profile")
+            self.config_repo.create_profile("default")
+            self.config_repo.load_profile("default")
+
         self.contrast_manager: ContrastManager = ContrastManager()
         self.stream_handler: StreamHandler = StreamHandler(handler_functions=stream_handler_callbacks)
 
@@ -355,6 +350,10 @@ class Microscope:
             )
 
         self.live_controller: LiveController = LiveController(microscope=self, camera=self.camera)
+
+        # Sync confocal mode from hardware (must be after LiveController creation)
+        if control._def.ENABLE_SPINNING_DISK_CONFOCAL:
+            self._sync_confocal_mode_from_hardware()
 
         if not skip_prepare_for_use:
             self._prepare_for_use()
@@ -376,7 +375,7 @@ class Microscope:
         """Sync confocal mode state from spinning disk hardware.
 
         Queries the actual hardware state (XLight disk position or Dragonfly modality)
-        and updates the channel configuration manager accordingly.
+        and updates the live controller accordingly.
         This ensures correct channel settings are used in both GUI and headless modes.
 
         Returns:
@@ -402,11 +401,10 @@ class Microscope:
                 sync_successful = False
 
         if sync_successful:
-            self.channel_configuration_mananger.sync_confocal_mode_from_hardware(confocal_mode)
+            self.live_controller.sync_confocal_mode_from_hardware(confocal_mode)
         else:
             self._log.warning(
-                "Confocal mode could not be synchronized from hardware; "
-                "keeping existing channel configuration manager state."
+                "Confocal mode could not be synchronized from hardware; " "keeping existing live controller state."
             )
         return sync_successful
 
@@ -414,7 +412,7 @@ class Microscope:
         """Set confocal/widefield mode and move the spinning disk.
 
         This is the preferred method for headless scripts to switch imaging modes.
-        It updates both the hardware and the channel configuration manager.
+        It updates both the hardware and the live controller.
 
         Args:
             confocal: True for confocal mode, False for widefield mode.
@@ -434,7 +432,7 @@ class Microscope:
         else:
             raise RuntimeError("No spinning disk hardware available")
 
-        self.channel_configuration_mananger.toggle_confocal_widefield(confocal)
+        self.live_controller.toggle_confocal_widefield(confocal)
 
     def is_confocal_mode(self) -> bool:
         """Check if currently in confocal mode.
@@ -442,7 +440,7 @@ class Microscope:
         Returns:
             True if in confocal mode, False if in widefield mode.
         """
-        return self.channel_configuration_mananger.is_confocal_mode()
+        return self.live_controller.is_confocal_mode()
 
     def update_camera_functions(self, functions: StreamHandlerFunctions) -> None:
         """Update the stream handler callback functions for the main camera.
@@ -704,9 +702,10 @@ class Microscope:
         """
         if objective is None:
             objective = self.objective_store.current_objective
-        channel_config = self.channel_configuration_mananger.get_channel_configuration_by_name(objective, channel)
-        channel_config.illumination_intensity = intensity
-        self.live_controller.set_microscope_mode(channel_config)
+        channel_config = self.live_controller.get_channel_by_name(objective, channel)
+        if channel_config:
+            channel_config.illumination_intensity = intensity
+            self.live_controller.set_microscope_mode(channel_config)
 
     def set_exposure_time(self, channel: str, exposure_time: float, objective: Optional[str] = None) -> None:
         """Set the exposure time for a channel.
@@ -718,6 +717,7 @@ class Microscope:
         """
         if objective is None:
             objective = self.objective_store.current_objective
-        channel_config = self.channel_configuration_mananger.get_channel_configuration_by_name(objective, channel)
-        channel_config.exposure_time = exposure_time
-        self.live_controller.set_microscope_mode(channel_config)
+        channel_config = self.live_controller.get_channel_by_name(objective, channel)
+        if channel_config:
+            channel_config.exposure_time = exposure_time
+            self.live_controller.set_microscope_mode(channel_config)

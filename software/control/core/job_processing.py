@@ -20,8 +20,14 @@ from control import _def, utils_acquisition
 from control._def import ZProjectionMode, DownsamplingMethod
 import squid.abc
 import squid.logging
-from control.utils_config import ChannelMode
+from control.models import AcquisitionChannel
 from control.core import utils_ome_tiff_writer as ome_tiff_writer
+from control.core.memory_profiler import (
+    start_worker_monitoring,
+    stop_worker_monitoring,
+    set_worker_operation,
+    log_memory,
+)
 
 
 @dataclass
@@ -73,7 +79,7 @@ class CaptureInfo:
     position: squid.abc.Pos
     z_index: int
     capture_time: float
-    configuration: ChannelMode
+    configuration: AcquisitionChannel
     save_directory: str
     file_id: str
     region_id: int
@@ -145,9 +151,23 @@ def _acquire_file_lock(lock_path: str, context: str = ""):
 
 
 class SaveImageJob(Job):
+    _log: ClassVar = squid.logging.get_logger("SaveImageJob")
+
     def run(self) -> bool:
-        is_color = len(self.image_array().shape) > 2
-        return self.save_image(self.image_array(), self.capture_info, is_color)
+        from control.core.io_simulation import is_simulation_enabled, simulated_tiff_write
+
+        image = self.image_array()
+
+        # Simulated disk I/O mode - encode to buffer, throttle, discard
+        if is_simulation_enabled():
+            bytes_written = simulated_tiff_write(image)
+            self._log.debug(
+                f"SaveImageJob {self.job_id}: simulated write of {bytes_written} bytes " f"(image shape={image.shape})"
+            )
+            return True
+
+        is_color = len(image.shape) > 2
+        return self.save_image(image, self.capture_info, is_color)
 
     def save_image(self, image: np.array, info: CaptureInfo, is_color: bool):
         # NOTE(imo): We silently fall back to individual image saving here.  We should warn or do something.
@@ -212,6 +232,7 @@ class SaveOMETiffJob(Job):
     The acquisition_info field is injected by JobRunner.dispatch() before the job runs.
     """
 
+    _log: ClassVar = squid.logging.get_logger("SaveOMETiffJob")
     acquisition_info: Optional[AcquisitionInfo] = field(default=None)
 
     def run(self) -> bool:
@@ -221,7 +242,42 @@ class SaveOMETiffJob(Job):
                 "This job must be dispatched via JobRunner.dispatch(), which injects acquisition_info. "
                 "If running directly, set job.acquisition_info before calling run()."
             )
-        self._save_ome_tiff(self.image_array(), self.capture_info)
+
+        from control.core.io_simulation import is_simulation_enabled, simulated_ome_tiff_write
+
+        image = self.image_array()
+
+        # Simulated disk I/O mode - encode to buffer, throttle, discard
+        if is_simulation_enabled():
+            # Build stack key from output path
+            ome_folder = ome_tiff_writer.ome_output_folder(self.acquisition_info, self.capture_info)
+            base_name = ome_tiff_writer.ome_base_name(self.capture_info)
+            stack_key = os.path.join(ome_folder, base_name)
+
+            # Determine 5D shape (T, Z, C, Y, X)
+            shape = (
+                self.acquisition_info.total_time_points,
+                self.acquisition_info.total_z_levels,
+                self.acquisition_info.total_channels,
+                image.shape[0],
+                image.shape[1],
+            )
+
+            bytes_written = simulated_ome_tiff_write(
+                image=image,
+                stack_key=stack_key,
+                shape=shape,
+                time_point=self.capture_info.time_point or 0,
+                z_index=self.capture_info.z_index,
+                channel_index=self.capture_info.configuration_idx,
+            )
+            self._log.debug(
+                f"SaveOMETiffJob {self.job_id}: simulated write of {bytes_written} bytes "
+                f"(image shape={image.shape})"
+            )
+            return True
+
+        self._save_ome_tiff(image, self.capture_info)
         return True
 
     def _save_ome_tiff(self, image: np.ndarray, info: CaptureInfo) -> None:
@@ -485,6 +541,9 @@ class DownsampledViewJob(Job):
         try:
             t_stitch_start = time.perf_counter()
 
+            # Memory tracking: stitching is memory-intensive
+            set_worker_operation(f"STITCH_{self.well_id}")
+
             # Stitch all channels
             stitched_channels = accumulator.stitch_all_channels()
 
@@ -500,6 +559,9 @@ class DownsampledViewJob(Job):
                 else self.interpolation_method
             )
 
+            # Memory tracking: downsampling phase
+            set_worker_operation(f"DOWNSAMPLE_{self.well_id}")
+
             # Generate plate view images first (at plate resolution only)
             t_downsample_plate_start = time.perf_counter()
             well_images_for_plate: Dict[int, np.ndarray] = {}
@@ -509,6 +571,9 @@ class DownsampledViewJob(Job):
                 )
                 well_images_for_plate[ch_idx] = downsampled
             t_downsample_plate_end = time.perf_counter()
+
+            # Memory tracking: save phase
+            set_worker_operation(f"SAVE_{self.well_id}")
 
             # Save TIFFs only if not skipping
             t_save_start = time.perf_counter()
@@ -597,8 +662,17 @@ class JobRunner(multiprocessing.Process):
         acquisition_info: Optional[AcquisitionInfo] = None,
         cleanup_stale_ome_files: bool = False,
         log_file_path: Optional[str] = None,
+        # Backpressure shared values (from BackpressureController)
+        bp_pending_jobs: Optional[multiprocessing.Value] = None,
+        bp_pending_bytes: Optional[multiprocessing.Value] = None,
+        bp_capacity_event: Optional[multiprocessing.Event] = None,
     ):
         super().__init__()
+        # Daemon processes are terminated when the main process exits, ensuring
+        # cleanup even if the main process crashes. Note: forceful termination
+        # means the shutdown cleanup code (releasing incomplete well bytes) may
+        # be skipped - see the cleanup block after the main while loop in run().
+        self.daemon = True
         self._log = squid.logging.get_logger(__class__.__name__)
         self._acquisition_info = acquisition_info
         self._log_file_path = log_file_path  # Will be used in subprocess to set up file logging
@@ -609,6 +683,11 @@ class JobRunner(multiprocessing.Process):
         self._shutdown_event: multiprocessing.Event = multiprocessing.Event()
         # Track jobs in flight (dispatched but not yet completed)
         self._pending_count = multiprocessing.Value("i", 0)
+
+        # Backpressure tracking (shared with BackpressureController)
+        self._bp_pending_jobs = bp_pending_jobs
+        self._bp_pending_bytes = bp_pending_bytes
+        self._bp_capacity_event = bp_capacity_event
 
         # Clean up stale metadata files from previous crashed acquisitions
         # Only run when explicitly requested (i.e., when OME-TIFF saving is being used)
@@ -628,18 +707,41 @@ class JobRunner(multiprocessing.Process):
                 )
             job.acquisition_info = self._acquisition_info
 
-        # Increment counter BEFORE putting job in queue to prevent race condition
+        # Calculate image bytes for backpressure tracking
+        image_bytes = 0
+        if self._bp_pending_jobs is not None:
+            if job.capture_image and job.capture_image.image_array is not None:
+                image_bytes = job.capture_image.image_array.nbytes
+
+        # Increment counters BEFORE putting job in queue to prevent race condition
         # where worker processes job before counter is incremented, causing
         # has_pending() to return False while job is still in flight.
         with self._pending_count.get_lock():
             self._pending_count.value += 1
+        if self._bp_pending_jobs is not None:
+            with self._bp_pending_jobs.get_lock():
+                self._bp_pending_jobs.value += 1
+            with self._bp_pending_bytes.get_lock():
+                self._bp_pending_bytes.value += image_bytes
+
         try:
             self._input_queue.put_nowait(job)
-        except Exception:
-            # Roll back pending count if enqueue fails so has_pending() remains accurate
-            with self._pending_count.get_lock():
-                self._pending_count.value -= 1
-            raise
+        except Exception as original_exc:
+            # Roll back ALL counters if enqueue fails
+            try:
+                with self._pending_count.get_lock():
+                    self._pending_count.value -= 1
+                if self._bp_pending_jobs is not None:
+                    with self._bp_pending_jobs.get_lock():
+                        self._bp_pending_jobs.value = max(0, self._bp_pending_jobs.value - 1)
+                    with self._bp_pending_bytes.get_lock():
+                        self._bp_pending_bytes.value = max(0, self._bp_pending_bytes.value - image_bytes)
+            except Exception as rollback_exc:
+                self._log.error(
+                    f"Failed to rollback counters after dispatch failure: {rollback_exc}. "
+                    f"Counters may be inconsistent. Original error: {original_exc}"
+                )
+            raise original_exc
         return True
 
     def output_queue(self) -> multiprocessing.Queue:
@@ -697,6 +799,10 @@ class JobRunner(multiprocessing.Process):
         worker_log_msg = f", worker_log={worker_log_path}" if worker_log_path else ""
         self._log.info(f"JobRunner subprocess started (PID={os.getpid()}{worker_log_msg})")
 
+        # Start memory monitoring for the worker process
+        start_worker_monitoring(sample_interval_ms=200)
+        log_memory("WORKER_START", include_children=False)
+
         while not self._shutdown_event.is_set():
             job = None
             try:
@@ -705,6 +811,12 @@ class JobRunner(multiprocessing.Process):
                 t_got_job = time.perf_counter()
 
                 self._log.info(f"Running job {job.job_id} (waited {(t_got_job - t_wait_start)*1000:.1f}ms in queue)...")
+
+                # Set operation context for memory tracking
+                if isinstance(job, DownsampledViewJob):
+                    set_worker_operation(f"DOWNSAMPLE_{job.well_id}")
+                else:
+                    set_worker_operation(job.__class__.__name__)
 
                 t_run_start = time.perf_counter()
                 result = job.run()
@@ -729,8 +841,33 @@ class JobRunner(multiprocessing.Process):
                     self._log.exception(f"Job {job.job_id} failed! Returning exception result.")
                     self._output_queue.put_nowait(JobResult(job_id=job.job_id, result=None, exception=e))
             finally:
+                # Clear operation context after job completes
+                set_worker_operation("")
                 # Decrement pending count when job completes (success, None result, or exception)
                 if job is not None:
                     with self._pending_count.get_lock():
                         self._pending_count.value -= 1
+
+                    # Backpressure tracking: decrement counters immediately when job completes.
+                    # Note: For DownsampledViewJob, the image data moves to subprocess memory
+                    # (the accumulator) when the job is processed. Backpressure tracks queue
+                    # memory, not subprocess memory, so it's correct to release bytes here
+                    # rather than waiting for well completion.
+                    if self._bp_pending_jobs is not None:
+                        with self._bp_pending_jobs.get_lock():
+                            self._bp_pending_jobs.value = max(0, self._bp_pending_jobs.value - 1)
+
+                        # Decrement image bytes
+                        if job.capture_image and job.capture_image.image_array is not None:
+                            image_bytes = job.capture_image.image_array.nbytes
+                            with self._bp_pending_bytes.get_lock():
+                                self._bp_pending_bytes.value = max(0, self._bp_pending_bytes.value - image_bytes)
+
+                        # Signal capacity available for all job completions
+                        if self._bp_capacity_event is not None:
+                            self._bp_capacity_event.set()
+
+        # Stop memory monitoring and log final report
+        log_memory("WORKER_SHUTDOWN", include_children=False)
+        stop_worker_monitoring()
         self._log.info("Shutdown request received, exiting run.")

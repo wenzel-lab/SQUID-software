@@ -11,9 +11,9 @@ import pandas as pd
 
 from control._def import *
 from control._def import DOWNSAMPLED_VIEW_JOB_TIMEOUT_S, DOWNSAMPLED_VIEW_IDLE_TIMEOUT_S
+import control._def
 from control import utils
 from control.core.auto_focus_controller import AutoFocusController
-from control.core.channel_configuration_mananger import ChannelConfigurationManager
 from control.core.laser_auto_focus_controller import LaserAutofocusController
 from control.core.live_controller import LiveController
 from control.core.multi_point_utils import (
@@ -28,7 +28,7 @@ from control.core.objective_store import ObjectiveStore
 from control.microcontroller import Microcontroller
 from control.microscope import Microscope
 from control.piezo import PiezoStage
-from control.utils_config import ChannelMode
+from control.models import AcquisitionChannel
 from squid.abc import AbstractCamera, CameraFrame, CameraFrameFormat
 import squid.logging
 import control.core.job_processing
@@ -50,6 +50,7 @@ from control.core.downsampled_views import (
     parse_well_id,
     ensure_plate_resolution_in_well_resolutions,
 )
+from control.core.backpressure import BackpressureController
 from squid.config import CameraPixelFormat
 
 
@@ -68,16 +69,17 @@ class MultiPointWorker:
         auto_focus_controller: Optional[AutoFocusController],
         laser_auto_focus_controller: Optional[LaserAutofocusController],
         objective_store: ObjectiveStore,
-        channel_configuration_mananger: ChannelConfigurationManager,
         acquisition_parameters: AcquisitionParameters,
         callbacks: MultiPointControllerFunctions,
         abort_requested_fn: Callable[[], bool],
         request_abort_fn: Callable[[], None],
         extra_job_classes: list[type[Job]] | None = None,
         abort_on_failed_jobs: bool = True,
+        alignment_widget=None,
     ):
         self._log = squid.logging.get_logger(__class__.__name__)
         self._timing = utils.TimingManager("MultiPointWorker Timer Manager")
+        self._alignment_widget = alignment_widget  # Optional AlignmentWidget for coordinate offset
         self.microscope: Microscope = scope
         self.camera: AbstractCamera = scope.camera
         self.microcontroller: Microcontroller = scope.low_level_drivers.microcontroller
@@ -87,7 +89,6 @@ class MultiPointWorker:
         self.autofocusController: Optional[AutoFocusController] = auto_focus_controller
         self.laser_auto_focus_controller: Optional[LaserAutofocusController] = laser_auto_focus_controller
         self.objectiveStore: ObjectiveStore = objective_store
-        self.channelConfigurationManager: ChannelConfigurationManager = channel_configuration_mananger
         self.fluidics = scope.addons.fluidics
         self.use_fluidics = acquisition_parameters.use_fluidics
 
@@ -225,6 +226,14 @@ class MultiPointWorker:
                 f"Downsampled view generation enabled ({mode}). Resolutions: {self._downsampled_well_resolutions_um} um"
             )
 
+        # Initialize backpressure controller for throttling acquisition when queue fills up
+        self._backpressure = BackpressureController(
+            max_jobs=control._def.ACQUISITION_MAX_PENDING_JOBS,
+            max_mb=control._def.ACQUISITION_MAX_PENDING_MB,
+            timeout_s=control._def.ACQUISITION_THROTTLE_TIMEOUT_S,
+            enabled=control._def.ACQUISITION_THROTTLING_ENABLED,
+        )
+
         # For now, use 1 runner per job class.  There's no real reason/rationale behind this, though.  The runners
         # can all run any job type.  But 1 per is a reasonable arbitrary arrangement while we don't have a lot
         # of job types.  If we have a lot of custom jobs, this could cause problems via resource hogging.
@@ -241,12 +250,15 @@ class MultiPointWorker:
                     self.acquisition_info,
                     cleanup_stale_ome_files=use_ome_tiff,
                     log_file_path=log_file_path,
+                    # Pass backpressure shared values for cross-process tracking
+                    bp_pending_jobs=self._backpressure.pending_jobs_value,
+                    bp_pending_bytes=self._backpressure.pending_bytes_value,
+                    bp_capacity_event=self._backpressure.capacity_event,
                 )
                 if Acquisition.USE_MULTIPROCESSING
                 else None
             )
             if job_runner:
-                job_runner.daemon = True
                 job_runner.start()
             self._job_runners.append((job_class, job_runner))
         self._abort_on_failed_job = abort_on_failed_jobs
@@ -448,6 +460,9 @@ class MultiPointWorker:
         # Final drain of all output queues
         self._summarize_runner_outputs(drain_all=True)
 
+        # Release backpressure resources now that all job runners are shut down
+        self._backpressure.close()
+
     def wait_till_operation_is_completed(self):
         self.microcontroller.wait_till_operation_is_completed()
 
@@ -523,12 +538,21 @@ class MultiPointWorker:
         self.coordinates_pd = pd.concat([self.coordinates_pd, new_row], ignore_index=True)
 
     def move_to_coordinate(self, coordinate_mm, region_id, fov):
-        self._log.info(f"moving to coordinate {coordinate_mm}")
         x_mm = coordinate_mm[0]
+        y_mm = coordinate_mm[1]
+
+        if self._alignment_widget is not None and self._alignment_widget.has_offset:
+            x_mm, y_mm = self._alignment_widget.apply_offset(x_mm, y_mm)
+            self._log.info(
+                f"moving to coordinate ({x_mm:.4f}, {y_mm:.4f}) "
+                f"[original: ({coordinate_mm[0]:.4f}, {coordinate_mm[1]:.4f}), offset applied]"
+            )
+        else:
+            self._log.info(f"moving to coordinate {coordinate_mm}")
+
         self.stage.move_x_to(x_mm)
         self._sleep(SCAN_STABILIZATION_TIME_MS_X / 1000)
 
-        y_mm = coordinate_mm[1]
         self.stage.move_y_to(y_mm)
         self._sleep(SCAN_STABILIZATION_TIME_MS_Y / 1000)
 
@@ -744,7 +768,9 @@ class MultiPointWorker:
             total_z_levels=self.NZ,
             z_projection_mode=self._downsampled_z_projection,
             interpolation_method=self._downsampled_interpolation_method,
-            skip_saving=self.skip_saving or not self._save_downsampled_well_images,
+            skip_saving=self.skip_saving
+            or not self._save_downsampled_well_images
+            or control._def.SIMULATED_DISK_IO_ENABLED,
         )
 
     def _initialize_downsampled_view_manager(self, image: np.ndarray) -> None:
@@ -958,6 +984,10 @@ class MultiPointWorker:
             self._downsampled_view_manager.save_plate_view(path)
 
     def run_coordinate_acquisition(self, current_path):
+        # Reset backpressure counters at acquisition start
+        # IMPORTANT: Must be before any camera triggers
+        self._backpressure.reset()
+
         n_regions = len(self.scan_region_coords_mm)
 
         for region_index, (region_id, coordinates) in enumerate(self.scan_region_fov_coords_mm.items()):
@@ -1065,7 +1095,7 @@ class MultiPointWorker:
         if self.NZ > 1:
             self.move_z_back_after_stack()
 
-    def _select_config(self, config: ChannelMode):
+    def _select_config(self, config: AcquisitionChannel):
         self.callbacks.signal_current_configuration(config)
         self.liveController.set_microscope_mode(config)
         self.wait_till_operation_is_completed()
@@ -1079,7 +1109,7 @@ class MultiPointWorker:
                 and (self.af_fov_count % Acquisition.NUMBER_OF_FOVS_PER_AF == 0)
             ):
                 configuration_name_AF = MULTIPOINT_AUTOFOCUS_CHANNEL
-                config_AF = self.channelConfigurationManager.get_channel_configuration_by_name(
+                config_AF = self.liveController.get_channel_by_name(
                     self.objectiveStore.current_objective, configuration_name_AF
                 )
                 self._select_config(config_AF)
@@ -1204,6 +1234,17 @@ class MultiPointWorker:
                 self._log.error("Frame callback never set _have_last_triggered_image callback! Aborting acquisition.")
                 self.request_abort_fn()
                 return
+
+        # Backpressure check AFTER previous frame dispatched, BEFORE next trigger
+        # This is when we know the previous image's jobs have been dispatched (and counters incremented)
+        if self._backpressure.should_throttle():
+            with self._timing.get_timer("backpressure.wait_for_capacity"):
+                got_capacity = self._backpressure.wait_for_capacity()
+                if not got_capacity:
+                    self._log.error(
+                        f"Backpressure timeout - disk I/O cannot keep up. Stats: {self._backpressure.get_stats()}"
+                    )
+
         with self._timing.get_timer("get_ready_for_trigger re-check"):
             # This should be a noop - we have the frame already.  Still, check!
             while not self.camera.get_ready_for_trigger():
@@ -1269,9 +1310,7 @@ class MultiPointWorker:
         rgb_channels = ["BF LED matrix full_R", "BF LED matrix full_G", "BF LED matrix full_B"]
         images = {}
 
-        for config_ in self.channelConfigurationManager.get_channel_configurations_for_objective(
-            self.objectiveStore.current_objective
-        ):
+        for config_ in self.liveController.get_channels(self.objectiveStore.current_objective):
             if config_.name in rgb_channels:
                 self._select_config(config_)
 

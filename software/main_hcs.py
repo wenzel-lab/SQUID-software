@@ -18,8 +18,12 @@ squid.logging.setup_uncaught_exception_logging()
 # app specific libraries
 import control.gui_hcs as gui
 from control._def import USE_TERMINAL_CONSOLE, ENABLE_MCP_SERVER_SUPPORT, CONTROL_SERVER_HOST, CONTROL_SERVER_PORT
+import control._def
 import control.utils
 import control.microscope
+
+# Import auto-migration function
+from tools.migrate_acquisition_configs import run_auto_migration
 
 
 if USE_TERMINAL_CONSOLE:
@@ -36,6 +40,9 @@ if __name__ == "__main__":
     parser.add_argument("--simulation", help="Run the GUI with simulated hardware.", action="store_true")
     parser.add_argument("--live-only", help="Run the GUI only the live viewer.", action="store_true")
     parser.add_argument("--verbose", help="Turn on verbose logging (DEBUG level)", action="store_true")
+    parser.add_argument(
+        "--start-server", help="Auto-start the MCP control server for programmatic control", action="store_true"
+    )
     args = parser.parse_args()
 
     log = squid.logging.get_logger("main_hcs")
@@ -50,7 +57,10 @@ if __name__ == "__main__":
 
     log.info(f"Squid Repository State: {control.utils.get_squid_repo_state_description()}")
 
-    app = QApplication([])
+    # Auto-migrate legacy acquisition configurations if present
+    run_auto_migration()
+
+    app = QApplication(["Squid"])
     app.setStyle("Fusion")
     app.setWindowIcon(QIcon("icon/cephla_logo.ico"))
     # This allows shutdown via ctrl+C even after the gui has popped up.
@@ -69,6 +79,20 @@ if __name__ == "__main__":
 
     menu_bar = win.menuBar()
     menu_bar.addMenu(microscope_utils_menu)
+
+    # Show startup warning if simulated disk I/O mode is enabled
+    if control._def.SIMULATED_DISK_IO_ENABLED:
+        QMessageBox.warning(
+            None,
+            "Development Mode Active",
+            "SIMULATED DISK I/O IS ENABLED\n\n"
+            "Images are encoded to memory (exercises RAM/CPU) but NOT saved to disk.\n"
+            f"Simulated write speed: {control._def.SIMULATED_DISK_IO_SPEED_MB_S} MB/s\n\n"
+            "This mode is for development/testing only.\n\n"
+            "To disable: Settings > Preferences > Advanced",
+            QMessageBox.Ok,
+        )
+
     win.show()
 
     if USE_TERMINAL_CONSOLE:
@@ -96,6 +120,10 @@ if __name__ == "__main__":
                 log.info(f"MCP control server started on {CONTROL_SERVER_HOST}:{CONTROL_SERVER_PORT}")
                 return True
             return False
+
+        # Auto-start server if --start-server flag is provided
+        if args.start_server:
+            start_control_server_if_needed()
 
         # Add MCP menu items to Settings menu
         settings_menu = None

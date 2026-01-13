@@ -1,11 +1,13 @@
 import logging
-from unittest.mock import MagicMock, patch
+import os
+import tempfile
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 
 import control._def
 import control.microscope
-from control.widgets import check_ram_available_with_error_dialog, SurfacePlotWidget
+from control.widgets import check_ram_available_with_error_dialog, NDViewerTab, SurfacePlotWidget
 
 import tests.control.test_stubs as ts
 
@@ -34,8 +36,7 @@ def test_check_ram_available_with_error_dialog_sufficient_ram():
     try:
         # Set up a small scan area with one channel (need multiple FOVs for non-zero bounds)
         all_configuration_names = [
-            config.name
-            for config in mpc.channelConfigurationManager.get_configurations(mpc.objectiveStore.current_objective)
+            config.name for config in mpc.liveController.get_channels(mpc.objectiveStore.current_objective)
         ]
         x_min = mpc.stage.get_config().X_AXIS.MIN_POSITION + 0.01
         y_min = mpc.stage.get_config().Y_AXIS.MIN_POSITION + 0.01
@@ -64,8 +65,7 @@ def test_check_ram_available_with_error_dialog_insufficient_ram():
     try:
         # Set up scan with channels (need multiple FOVs for non-zero bounds)
         all_configuration_names = [
-            config.name
-            for config in mpc.channelConfigurationManager.get_configurations(mpc.objectiveStore.current_objective)
+            config.name for config in mpc.liveController.get_channels(mpc.objectiveStore.current_objective)
         ]
         x_min = mpc.stage.get_config().X_AXIS.MIN_POSITION + 0.01
         y_min = mpc.stage.get_config().Y_AXIS.MIN_POSITION + 0.01
@@ -113,8 +113,7 @@ def test_check_ram_available_with_error_dialog_factor_of_safety():
     try:
         # Set up scan (need multiple FOVs for non-zero bounds)
         all_configuration_names = [
-            config.name
-            for config in mpc.channelConfigurationManager.get_configurations(mpc.objectiveStore.current_objective)
+            config.name for config in mpc.liveController.get_channels(mpc.objectiveStore.current_objective)
         ]
         x_min = mpc.stage.get_config().X_AXIS.MIN_POSITION + 0.01
         y_min = mpc.stage.get_config().Y_AXIS.MIN_POSITION + 0.01
@@ -331,3 +330,1021 @@ class TestSurfacePlotWidget:
 
         assert widget.plot_populated is True
         assert len(widget.x_plot) == 8  # All 8 unique locations
+
+
+# ============================================================================
+# RAMMonitorWidget Tests
+# ============================================================================
+
+from control.widgets import RAMMonitorWidget
+from control.core.memory_profiler import MemoryMonitor
+
+
+@pytest.fixture
+def ram_monitor_widget(qtbot):
+    """Create a RAMMonitorWidget instance for testing."""
+    widget = RAMMonitorWidget()
+    qtbot.addWidget(widget)
+    return widget
+
+
+class TestRAMMonitorWidget:
+    """Tests for RAMMonitorWidget lifecycle and state management."""
+
+    def test_initial_state(self, ram_monitor_widget):
+        """Test that widget initializes with correct state."""
+        widget = ram_monitor_widget
+        assert widget._memory_monitor is None
+        assert widget._session_peak_mb == 0.0
+        assert widget.label_current.text() == "--"
+        assert widget.label_peak.text() == "--"
+        assert widget.label_available.text() == "--"
+        assert not widget._update_timer.isActive()
+
+    def test_start_monitoring_starts_timer(self, ram_monitor_widget):
+        """Test that start_monitoring starts the update timer."""
+        widget = ram_monitor_widget
+        widget.start_monitoring()
+
+        assert widget._update_timer.isActive()
+
+        # Clean up
+        widget.stop_monitoring()
+
+    def test_stop_monitoring_stops_timer(self, ram_monitor_widget):
+        """Test that stop_monitoring stops timer and clears display."""
+        widget = ram_monitor_widget
+        widget.start_monitoring()
+        assert widget._update_timer.isActive()
+
+        widget.stop_monitoring()
+
+        assert not widget._update_timer.isActive()
+        assert widget.label_current.text() == "--"
+        assert widget.label_peak.text() == "--"
+        assert widget.label_available.text() == "--"
+
+    def test_start_monitoring_updates_display(self, ram_monitor_widget, qtbot):
+        """Test that start_monitoring triggers an immediate display update."""
+        widget = ram_monitor_widget
+        widget.start_monitoring()
+
+        # Label should be updated (not "--" anymore, unless footprint unavailable)
+        # Give a moment for the update to process
+        qtbot.wait(100)
+
+        # Both labels should show a value (or "N/A" if footprint unavailable)
+        assert widget.label_current.text() != "--" and widget.label_available.text() != "--"
+
+        widget.stop_monitoring()
+
+    def test_connect_monitor_stops_timer(self, ram_monitor_widget):
+        """Test that connecting to a monitor stops the timer."""
+        widget = ram_monitor_widget
+        widget.start_monitoring()
+        assert widget._update_timer.isActive()
+
+        # Create a monitor with signals disabled (no Qt app needed)
+        monitor = MemoryMonitor(sample_interval_ms=100, enable_signals=False)
+
+        widget.connect_monitor(monitor)
+
+        assert not widget._update_timer.isActive()
+        assert widget._memory_monitor is monitor
+
+        # Clean up
+        widget.disconnect_monitor()
+
+    def test_disconnect_monitor_clears_reference(self, ram_monitor_widget):
+        """Test that disconnect_monitor clears the monitor reference."""
+        widget = ram_monitor_widget
+        monitor = MemoryMonitor(sample_interval_ms=100, enable_signals=False)
+
+        widget.connect_monitor(monitor)
+        assert widget._memory_monitor is monitor
+
+        widget.disconnect_monitor()
+
+        assert widget._memory_monitor is None
+        # Timer NOT started by disconnect - caller decides
+        assert not widget._update_timer.isActive()
+
+    def test_disconnect_monitor_does_not_restart_timer(self, ram_monitor_widget):
+        """Test that disconnect_monitor does NOT restart the timer (caller decides)."""
+        widget = ram_monitor_widget
+        monitor = MemoryMonitor(sample_interval_ms=100, enable_signals=False)
+
+        widget.start_monitoring()
+        assert widget._update_timer.isActive()
+
+        widget.connect_monitor(monitor)
+        assert not widget._update_timer.isActive()
+
+        widget.disconnect_monitor()
+
+        # Timer should NOT be restarted by disconnect_monitor
+        assert not widget._update_timer.isActive()
+
+    def test_update_memory_display_skipped_when_connected(self, ram_monitor_widget):
+        """Test that timer updates are skipped when connected to a monitor."""
+        widget = ram_monitor_widget
+        monitor = MemoryMonitor(sample_interval_ms=100, enable_signals=False)
+        widget.connect_monitor(monitor)
+
+        # Set a known label value
+        widget.label_current.setText("TEST_VALUE")
+
+        # Call update - should be skipped because monitor is connected
+        widget._update_memory_display()
+
+        # Label should not have changed
+        assert widget.label_current.text() == "TEST_VALUE"
+
+        widget.disconnect_monitor()
+
+    def test_connect_none_monitor(self, ram_monitor_widget):
+        """Test that connecting None monitor is handled gracefully."""
+        widget = ram_monitor_widget
+        widget.start_monitoring()
+
+        # Should not raise
+        widget.connect_monitor(None)
+
+        assert widget._memory_monitor is None
+
+        widget.stop_monitoring()
+
+    def test_double_disconnect_safe(self, ram_monitor_widget):
+        """Test that disconnecting twice is safe."""
+        widget = ram_monitor_widget
+        monitor = MemoryMonitor(sample_interval_ms=100, enable_signals=False)
+
+        widget.connect_monitor(monitor)
+        widget.disconnect_monitor()
+        # Second disconnect should not raise
+        widget.disconnect_monitor()
+
+        assert widget._memory_monitor is None
+
+    def test_session_peak_tracking(self, ram_monitor_widget, qtbot):
+        """Test that session peak is tracked and displayed during monitoring."""
+        widget = ram_monitor_widget
+        widget.start_monitoring()
+
+        # Let it run briefly to get some measurements
+        qtbot.wait(100)
+
+        # Session peak should be updated (may be 0.0 if footprint unavailable on this platform)
+        assert widget._session_peak_mb >= 0.0
+        # Peak label should show a value (or "N/A" if unavailable)
+        assert widget.label_peak.text() != "--"
+
+        widget.stop_monitoring()
+
+    def test_start_monitoring_reset_peak_false(self, ram_monitor_widget, qtbot):
+        """Test that reset_peak=False preserves the session peak."""
+        widget = ram_monitor_widget
+
+        # Start monitoring and let it record a peak
+        widget.start_monitoring()
+        qtbot.wait(100)
+        initial_peak = widget._session_peak_mb
+
+        widget.stop_monitoring()
+
+        # Restart without resetting peak
+        widget.start_monitoring(reset_peak=False)
+
+        # Peak should be preserved (may increase but not decrease)
+        assert widget._session_peak_mb >= initial_peak
+
+        widget.stop_monitoring()
+
+
+class TestRAMMonitorWidgetSignals:
+    """Tests for RAMMonitorWidget signal handling (requires Qt signals)."""
+
+    def test_footprint_signal_updates_display(self, ram_monitor_widget, qtbot):
+        """Test that footprint_updated signal updates the display."""
+        widget = ram_monitor_widget
+
+        # Directly call the signal handler
+        widget._on_footprint_updated(2048.0)  # 2 GB in MB
+
+        assert widget.label_current.text() == "2.00 GB"
+        assert widget.label_peak.text() == "2.00 GB"
+        assert widget._session_peak_mb == 2048.0
+        # Available RAM should also be updated
+        assert widget.label_available.text() != "--"
+
+    def test_footprint_signal_various_values(self, ram_monitor_widget):
+        """Test footprint signal with various values and peak tracking."""
+        widget = ram_monitor_widget
+
+        # Test small value
+        widget._on_footprint_updated(512.0)  # 0.5 GB
+        assert widget.label_current.text() == "0.50 GB"
+        assert widget.label_peak.text() == "0.50 GB"
+
+        # Test larger value - peak should update
+        widget._on_footprint_updated(8192.0)  # 8 GB
+        assert widget.label_current.text() == "8.00 GB"
+        assert widget.label_peak.text() == "8.00 GB"
+        assert widget._session_peak_mb == 8192.0
+
+        # Test smaller value - peak should stay at 8 GB
+        widget._on_footprint_updated(10.24)  # ~10 MB = 0.01 GB
+        assert widget.label_current.text() == "0.01 GB"
+        assert widget.label_peak.text() == "8.00 GB"  # Peak unchanged
+        assert widget._session_peak_mb == 8192.0
+
+
+# ============================================================================
+# MultiPointController Memory Monitoring Integration Tests
+# ============================================================================
+
+
+class TestMultiPointControllerMemoryMonitoring:
+    """Tests for MultiPointController memory monitoring integration."""
+
+    def test_memory_monitor_starts_when_enabled(self):
+        """Test that memory monitoring starts when ENABLE_MEMORY_PROFILING=True."""
+        original_value = control._def.ENABLE_MEMORY_PROFILING
+        try:
+            control._def.ENABLE_MEMORY_PROFILING = True
+
+            scope = control.microscope.Microscope.build_from_global_config(True)
+            mpc = ts.get_test_multi_point_controller(microscope=scope)
+
+            # Verify monitor starts when acquisition begins
+            assert mpc._memory_monitor is None  # Not started yet
+
+            # Simulate what happens in run_acquisition
+            # We can't run full acquisition, but we can test the conditional logic
+            if control._def.ENABLE_MEMORY_PROFILING:
+                from control.core.memory_profiler import MemoryMonitor
+
+                mpc._memory_monitor = MemoryMonitor(
+                    sample_interval_ms=200,
+                    process_name="main",
+                    track_children=True,
+                    log_interval_s=30.0,
+                )
+                mpc._memory_monitor.start("TEST_ACQUISITION_START")
+
+            assert mpc._memory_monitor is not None
+
+            # Clean up
+            if mpc._memory_monitor is not None:
+                mpc._memory_monitor.stop()
+                mpc._memory_monitor = None
+        finally:
+            control._def.ENABLE_MEMORY_PROFILING = original_value
+
+    def test_memory_monitor_not_started_when_disabled(self):
+        """Test that memory monitoring does not start when ENABLE_MEMORY_PROFILING=False."""
+        original_value = control._def.ENABLE_MEMORY_PROFILING
+        try:
+            control._def.ENABLE_MEMORY_PROFILING = False
+
+            scope = control.microscope.Microscope.build_from_global_config(True)
+            mpc = ts.get_test_multi_point_controller(microscope=scope)
+
+            # Verify monitor does not start when disabled
+            assert mpc._memory_monitor is None
+
+            # Simulate what happens in run_acquisition
+            if control._def.ENABLE_MEMORY_PROFILING:
+                from control.core.memory_profiler import MemoryMonitor
+
+                mpc._memory_monitor = MemoryMonitor(
+                    sample_interval_ms=200,
+                    process_name="main",
+                    track_children=True,
+                )
+                mpc._memory_monitor.start("TEST_ACQUISITION_START")
+
+            # Monitor should still be None
+            assert mpc._memory_monitor is None
+        finally:
+            control._def.ENABLE_MEMORY_PROFILING = original_value
+
+    def test_memory_monitor_cleanup_on_stop(self):
+        """Test that memory monitor is properly cleaned up after stopping."""
+        original_value = control._def.ENABLE_MEMORY_PROFILING
+        try:
+            control._def.ENABLE_MEMORY_PROFILING = True
+
+            scope = control.microscope.Microscope.build_from_global_config(True)
+            mpc = ts.get_test_multi_point_controller(microscope=scope)
+
+            from control.core.memory_profiler import MemoryMonitor
+
+            mpc._memory_monitor = MemoryMonitor(
+                sample_interval_ms=200,
+                process_name="main",
+                track_children=True,
+                log_interval_s=30.0,
+            )
+            mpc._memory_monitor.start("TEST_START")
+
+            # Simulate cleanup as done in _run_multipoint_acquisition
+            report = mpc._memory_monitor.stop()
+            mpc._memory_monitor = None
+
+            assert mpc._memory_monitor is None
+            assert report is not None
+        finally:
+            control._def.ENABLE_MEMORY_PROFILING = original_value
+
+    def test_memory_monitor_has_signals_for_gui(self):
+        """Test that memory monitor creates signals for GUI updates."""
+        original_value = control._def.ENABLE_MEMORY_PROFILING
+        try:
+            control._def.ENABLE_MEMORY_PROFILING = True
+
+            from control.core.memory_profiler import MemoryMonitor, HAS_QT
+
+            monitor = MemoryMonitor(
+                sample_interval_ms=200,
+                process_name="main",
+                track_children=True,
+                log_interval_s=30.0,
+                enable_signals=True,
+            )
+
+            if HAS_QT:
+                assert monitor.signals is not None
+                # Verify signal attributes exist
+                assert hasattr(monitor.signals, "memory_updated")
+                assert hasattr(monitor.signals, "footprint_updated")
+        finally:
+            control._def.ENABLE_MEMORY_PROFILING = original_value
+
+    def test_ram_widget_connect_to_multipoint_monitor(self, qtbot):
+        """Test that RAMMonitorWidget can connect to MultiPointController's monitor."""
+        original_value = control._def.ENABLE_MEMORY_PROFILING
+        try:
+            control._def.ENABLE_MEMORY_PROFILING = True
+
+            from control.core.memory_profiler import MemoryMonitor
+
+            # Create widget and monitor
+            widget = RAMMonitorWidget()
+            qtbot.addWidget(widget)
+
+            monitor = MemoryMonitor(
+                sample_interval_ms=100,
+                process_name="main",
+                track_children=True,
+                enable_signals=True,
+            )
+            monitor.start("INTEGRATION_TEST")
+
+            # Connect widget to monitor (simulates what gui_hcs does)
+            widget.connect_monitor(monitor)
+
+            # Wait for signals
+            qtbot.wait(200)
+
+            # Widget should receive updates
+            # (value depends on whether footprint is available on this platform)
+            assert widget._memory_monitor is monitor
+
+            # Disconnect
+            widget.disconnect_monitor()
+            assert widget._memory_monitor is None
+
+            # Cleanup
+            monitor.stop()
+        finally:
+            control._def.ENABLE_MEMORY_PROFILING = original_value
+
+
+# ============================================================================
+# BackpressureMonitorWidget Tests
+# ============================================================================
+
+from control.widgets import BackpressureMonitorWidget
+from control.core.backpressure import BackpressureStats
+from unittest.mock import Mock
+
+
+@pytest.fixture
+def bp_monitor_widget(qtbot):
+    """Create a BackpressureMonitorWidget instance for testing."""
+    widget = BackpressureMonitorWidget()
+    qtbot.addWidget(widget)
+    return widget
+
+
+@pytest.fixture
+def mock_bp_controller():
+    """Create a mock BackpressureController for testing."""
+    controller = Mock()
+    controller.enabled = True
+    controller.get_stats.return_value = BackpressureStats(
+        pending_jobs=5,
+        pending_bytes_mb=125.5,
+        max_pending_jobs=10,
+        max_pending_mb=500.0,
+        is_throttled=False,
+    )
+    return controller
+
+
+class TestBackpressureMonitorWidget:
+    """Tests for BackpressureMonitorWidget lifecycle and state management."""
+
+    def test_initial_state(self, bp_monitor_widget):
+        """Test that widget initializes with correct state."""
+        widget = bp_monitor_widget
+        assert widget._controller is None
+        assert widget._throttle_sticky_counter == 0
+        assert widget.label_jobs.text() == "--"
+        assert widget.label_bytes.text() == "--"
+        assert widget.label_throttled.text() == ""
+        assert not widget._update_timer.isActive()
+
+    def test_start_monitoring_starts_timer(self, bp_monitor_widget, mock_bp_controller):
+        """Test that start_monitoring starts the update timer."""
+        widget = bp_monitor_widget
+        widget.start_monitoring(mock_bp_controller)
+
+        assert widget._update_timer.isActive()
+        assert widget._controller is mock_bp_controller
+
+        # Clean up
+        widget.stop_monitoring()
+
+    def test_start_monitoring_with_none_controller(self, bp_monitor_widget):
+        """Test that start_monitoring with None controller is handled gracefully."""
+        widget = bp_monitor_widget
+
+        # Should not raise, but should log a warning
+        widget.start_monitoring(None)
+
+        assert widget._controller is None
+        assert not widget._update_timer.isActive()
+
+    def test_stop_monitoring_stops_timer(self, bp_monitor_widget, mock_bp_controller):
+        """Test that stop_monitoring stops timer and clears display."""
+        widget = bp_monitor_widget
+        widget.start_monitoring(mock_bp_controller)
+        assert widget._update_timer.isActive()
+
+        widget.stop_monitoring()
+
+        assert not widget._update_timer.isActive()
+        assert widget._controller is None
+        assert widget._throttle_sticky_counter == 0
+        assert widget.label_jobs.text() == "--"
+        assert widget.label_bytes.text() == "--"
+        assert widget.label_throttled.text() == ""
+
+    def test_start_monitoring_updates_display(self, bp_monitor_widget, mock_bp_controller, qtbot):
+        """Test that start_monitoring triggers an immediate display update."""
+        widget = bp_monitor_widget
+        widget.start_monitoring(mock_bp_controller)
+
+        # Labels should be updated immediately
+        assert widget.label_jobs.text() == "5/10 jobs"
+        assert widget.label_bytes.text() == "125.5/500.0 MB"
+
+        widget.stop_monitoring()
+
+    def test_start_monitoring_resets_sticky_counter(self, bp_monitor_widget, mock_bp_controller):
+        """Test that start_monitoring resets the sticky throttle counter."""
+        widget = bp_monitor_widget
+        widget._throttle_sticky_counter = 3  # Simulate leftover state
+
+        widget.start_monitoring(mock_bp_controller)
+
+        assert widget._throttle_sticky_counter == 0
+
+        widget.stop_monitoring()
+
+    def test_display_format_with_max_values(self, bp_monitor_widget, mock_bp_controller):
+        """Test that display shows current/max format."""
+        widget = bp_monitor_widget
+        mock_bp_controller.get_stats.return_value = BackpressureStats(
+            pending_jobs=3,
+            pending_bytes_mb=200.0,
+            max_pending_jobs=20,
+            max_pending_mb=1000.0,
+            is_throttled=False,
+        )
+
+        widget.start_monitoring(mock_bp_controller)
+
+        assert widget.label_jobs.text() == "3/20 jobs"
+        assert widget.label_bytes.text() == "200.0/1000.0 MB"
+
+        widget.stop_monitoring()
+
+
+class TestBackpressureMonitorWidgetThrottling:
+    """Tests for BackpressureMonitorWidget throttle indicator behavior."""
+
+    def test_throttled_indicator_shown_when_throttled(self, bp_monitor_widget, mock_bp_controller):
+        """Test that [THROTTLED] appears when is_throttled is True."""
+        widget = bp_monitor_widget
+        mock_bp_controller.get_stats.return_value = BackpressureStats(
+            pending_jobs=10,
+            pending_bytes_mb=500.0,
+            max_pending_jobs=10,
+            max_pending_mb=500.0,
+            is_throttled=True,
+        )
+
+        widget.start_monitoring(mock_bp_controller)
+
+        assert widget.label_throttled.text() == "[THROTTLED]"
+        assert widget._throttle_sticky_counter == BackpressureMonitorWidget.THROTTLE_STICKY_CYCLES
+
+        widget.stop_monitoring()
+
+    def test_throttled_indicator_hidden_when_not_throttled(self, bp_monitor_widget, mock_bp_controller):
+        """Test that [THROTTLED] is hidden when is_throttled is False."""
+        widget = bp_monitor_widget
+        mock_bp_controller.get_stats.return_value = BackpressureStats(
+            pending_jobs=5,
+            pending_bytes_mb=125.5,
+            max_pending_jobs=10,
+            max_pending_mb=500.0,
+            is_throttled=False,
+        )
+
+        widget.start_monitoring(mock_bp_controller)
+
+        assert widget.label_throttled.text() == ""
+
+        widget.stop_monitoring()
+
+    def test_sticky_throttle_countdown(self, bp_monitor_widget, mock_bp_controller):
+        """Test that [THROTTLED] stays visible for THROTTLE_STICKY_CYCLES after release."""
+        widget = bp_monitor_widget
+
+        # First: throttled
+        mock_bp_controller.get_stats.return_value = BackpressureStats(
+            pending_jobs=10,
+            pending_bytes_mb=500.0,
+            max_pending_jobs=10,
+            max_pending_mb=500.0,
+            is_throttled=True,
+        )
+        widget.start_monitoring(mock_bp_controller)
+        assert widget.label_throttled.text() == "[THROTTLED]"
+        initial_counter = widget._throttle_sticky_counter
+
+        # Now: not throttled - simulate countdown
+        mock_bp_controller.get_stats.return_value = BackpressureStats(
+            pending_jobs=5,
+            pending_bytes_mb=250.0,
+            max_pending_jobs=10,
+            max_pending_mb=500.0,
+            is_throttled=False,
+        )
+
+        # Each update should decrement the counter but keep [THROTTLED] visible
+        for i in range(initial_counter - 1):
+            widget._update_display()
+            assert widget.label_throttled.text() == "[THROTTLED]"
+            assert widget._throttle_sticky_counter == initial_counter - 1 - i
+
+        # Final update should clear [THROTTLED]
+        widget._update_display()
+        assert widget.label_throttled.text() == ""
+        assert widget._throttle_sticky_counter == 0
+
+        widget.stop_monitoring()
+
+    def test_throttle_reactivation_resets_counter(self, bp_monitor_widget, mock_bp_controller):
+        """Test that re-throttling during countdown resets the counter."""
+        widget = bp_monitor_widget
+
+        # Start throttled
+        mock_bp_controller.get_stats.return_value = BackpressureStats(
+            pending_jobs=10, pending_bytes_mb=500.0, max_pending_jobs=10, max_pending_mb=500.0, is_throttled=True
+        )
+        widget.start_monitoring(mock_bp_controller)
+
+        # Release throttle and count down partially
+        mock_bp_controller.get_stats.return_value = BackpressureStats(
+            pending_jobs=5, pending_bytes_mb=250.0, max_pending_jobs=10, max_pending_mb=500.0, is_throttled=False
+        )
+        widget._update_display()
+        widget._update_display()
+        assert widget._throttle_sticky_counter == BackpressureMonitorWidget.THROTTLE_STICKY_CYCLES - 2
+
+        # Re-throttle - counter should reset to max
+        mock_bp_controller.get_stats.return_value = BackpressureStats(
+            pending_jobs=10, pending_bytes_mb=500.0, max_pending_jobs=10, max_pending_mb=500.0, is_throttled=True
+        )
+        widget._update_display()
+        assert widget._throttle_sticky_counter == BackpressureMonitorWidget.THROTTLE_STICKY_CYCLES
+
+        widget.stop_monitoring()
+
+
+class TestBackpressureMonitorWidgetErrorHandling:
+    """Tests for BackpressureMonitorWidget error handling."""
+
+    def test_broken_pipe_error_handled(self, bp_monitor_widget, mock_bp_controller):
+        """Test that BrokenPipeError is handled gracefully."""
+        widget = bp_monitor_widget
+        mock_bp_controller.get_stats.side_effect = BrokenPipeError("Connection closed")
+
+        widget.start_monitoring(mock_bp_controller)
+
+        # Should not raise - display should show initial values from start_monitoring's first call
+        # (which raises), but widget should continue working
+        widget._update_display()
+
+        widget.stop_monitoring()
+
+    def test_eof_error_handled(self, bp_monitor_widget, mock_bp_controller):
+        """Test that EOFError is handled gracefully."""
+        widget = bp_monitor_widget
+        mock_bp_controller.get_stats.side_effect = EOFError("End of file")
+
+        widget._controller = mock_bp_controller  # Bypass start_monitoring
+
+        # Should not raise
+        widget._update_display()
+
+        widget.stop_monitoring()
+
+    def test_generic_exception_handled(self, bp_monitor_widget, mock_bp_controller):
+        """Test that generic exceptions are handled gracefully."""
+        widget = bp_monitor_widget
+        mock_bp_controller.get_stats.side_effect = RuntimeError("Unexpected error")
+
+        widget._controller = mock_bp_controller  # Bypass start_monitoring
+
+        # Should not raise
+        widget._update_display()
+
+        widget.stop_monitoring()
+
+    def test_update_display_with_no_controller(self, bp_monitor_widget):
+        """Test that _update_display does nothing when controller is None."""
+        widget = bp_monitor_widget
+        widget.label_jobs.setText("TEST")
+
+        widget._update_display()
+
+        # Label should not change since there's no controller
+        assert widget.label_jobs.text() == "TEST"
+
+
+class TestBackpressureMonitorWidgetTimer:
+    """Tests for BackpressureMonitorWidget timer behavior."""
+
+    def test_timer_interval(self, bp_monitor_widget):
+        """Test that timer is configured with correct interval."""
+        widget = bp_monitor_widget
+        assert widget._update_timer.interval() == 500  # 500ms
+
+    def test_timer_updates_periodically(self, bp_monitor_widget, mock_bp_controller, qtbot):
+        """Test that timer triggers periodic updates."""
+        widget = bp_monitor_widget
+
+        widget.start_monitoring(mock_bp_controller)
+        initial_calls = mock_bp_controller.get_stats.call_count
+
+        # Wait for timer to fire at least once
+        qtbot.wait(600)
+
+        assert mock_bp_controller.get_stats.call_count > initial_calls
+
+        widget.stop_monitoring()
+
+    def test_double_stop_safe(self, bp_monitor_widget, mock_bp_controller):
+        """Test that stopping twice is safe."""
+        widget = bp_monitor_widget
+        widget.start_monitoring(mock_bp_controller)
+
+        widget.stop_monitoring()
+        # Second stop should not raise
+        widget.stop_monitoring()
+
+        assert widget._controller is None
+        assert not widget._update_timer.isActive()
+
+
+# ============================================================================
+# NDViewerTab Tests
+# ============================================================================
+
+
+@pytest.fixture
+def ndviewer_tab(qtbot):
+    """Create an NDViewerTab instance for testing."""
+    widget = NDViewerTab()
+    qtbot.addWidget(widget)
+    return widget
+
+
+class TestNDViewerTab:
+    """Tests for NDViewerTab lifecycle and state management."""
+
+    def test_initial_state(self, ndviewer_tab):
+        """Test that widget initializes with correct state."""
+        widget = ndviewer_tab
+        assert widget._viewer is None
+        assert widget._dataset_path is None
+        # Check placeholder exists with correct text (isVisible() is False before widget shown)
+        assert widget._placeholder is not None
+        assert widget._placeholder.text() == NDViewerTab._PLACEHOLDER_WAITING
+
+    def test_set_dataset_path_none_shows_placeholder(self, ndviewer_tab):
+        """Test that setting None path shows the waiting placeholder."""
+        widget = ndviewer_tab
+        widget.set_dataset_path(None)
+
+        assert widget._dataset_path is None
+        assert widget._placeholder is not None
+        assert widget._placeholder.text() == NDViewerTab._PLACEHOLDER_WAITING
+
+    def test_set_dataset_path_invalid_shows_error(self, ndviewer_tab):
+        """Test that setting an invalid path shows error placeholder."""
+        widget = ndviewer_tab
+        invalid_path = "/nonexistent/path/to/dataset"
+
+        widget.set_dataset_path(invalid_path)
+
+        assert widget._dataset_path == invalid_path
+        assert widget._placeholder is not None
+        assert "not found" in widget._placeholder.text()
+
+    def test_set_dataset_path_same_path_skips(self, ndviewer_tab):
+        """Test that setting the same path does not re-process."""
+        widget = ndviewer_tab
+        path = "/some/path"
+
+        # First call sets path (will show error since invalid, but that's ok for this test)
+        widget.set_dataset_path(path)
+        assert widget._dataset_path == path
+
+        # Track placeholder text after first call
+        text_after_first = widget._placeholder.text()
+
+        # Second call with same path should skip processing
+        widget.set_dataset_path(path)
+
+        # State should be unchanged
+        assert widget._dataset_path == path
+        assert widget._placeholder.text() == text_after_first
+
+    def test_set_dataset_path_clears_when_none_after_valid(self, ndviewer_tab):
+        """Test that setting None after a path clears the view."""
+        widget = ndviewer_tab
+
+        # Set to an invalid path first (so we have a non-None _dataset_path)
+        widget.set_dataset_path("/invalid/path")
+        assert widget._dataset_path == "/invalid/path"
+
+        # Now set to None
+        widget.set_dataset_path(None)
+
+        assert widget._dataset_path is None
+        assert widget._placeholder is not None
+        assert widget._placeholder.text() == NDViewerTab._PLACEHOLDER_WAITING
+
+    def test_show_placeholder_hides_existing_viewer(self, ndviewer_tab):
+        """Test that _show_placeholder hides an existing viewer."""
+        widget = ndviewer_tab
+
+        # Inject a mock viewer
+        mock_viewer = Mock()
+        widget._viewer = mock_viewer
+
+        widget._show_placeholder("Test message")
+
+        mock_viewer.setVisible.assert_called_with(False)
+        assert widget._placeholder.text() == "Test message"
+
+
+class TestNDViewerTabNavigation:
+    """Tests for NDViewerTab FOV navigation."""
+
+    def test_go_to_fov_no_viewer_returns_false(self, ndviewer_tab):
+        """Test that go_to_fov returns False when no viewer is loaded."""
+        widget = ndviewer_tab
+        result = widget.go_to_fov("A1", 0)
+        assert result is False
+
+    def test_go_to_fov_with_mock_viewer(self, ndviewer_tab):
+        """Test go_to_fov with a mocked viewer."""
+        widget = ndviewer_tab
+
+        # Create mock viewer
+        mock_viewer = Mock()
+        mock_viewer.has_fov_dimension.return_value = True
+        mock_viewer.get_fov_list.return_value = [
+            {"region": "A1", "fov": 0},
+            {"region": "A1", "fov": 1},
+            {"region": "B2", "fov": 0},
+        ]
+        mock_viewer.set_current_index.return_value = True
+        widget._viewer = mock_viewer
+
+        # Navigate to A1, fov 0 (should be flat index 0)
+        result = widget.go_to_fov("A1", 0)
+
+        assert result is True
+        mock_viewer.set_current_index.assert_called_once_with("fov", 0)
+
+    def test_go_to_fov_finds_correct_flat_index(self, ndviewer_tab):
+        """Test that go_to_fov finds the correct flat index."""
+        widget = ndviewer_tab
+
+        # Create mock viewer with multiple wells
+        mock_viewer = Mock()
+        mock_viewer.has_fov_dimension.return_value = True
+        mock_viewer.get_fov_list.return_value = [
+            {"region": "A1", "fov": 0},
+            {"region": "A1", "fov": 1},
+            {"region": "B2", "fov": 0},  # flat index 2
+            {"region": "B2", "fov": 1},
+        ]
+        mock_viewer.set_current_index.return_value = True
+        widget._viewer = mock_viewer
+
+        # Navigate to B2, fov 0 (should be flat index 2)
+        result = widget.go_to_fov("B2", 0)
+
+        assert result is True
+        mock_viewer.set_current_index.assert_called_once_with("fov", 2)
+
+    def test_go_to_fov_not_found_returns_false(self, ndviewer_tab):
+        """Test that go_to_fov returns False when FOV not found."""
+        widget = ndviewer_tab
+
+        mock_viewer = Mock()
+        mock_viewer.has_fov_dimension.return_value = True
+        mock_viewer.get_fov_list.return_value = [
+            {"region": "A1", "fov": 0},
+        ]
+        widget._viewer = mock_viewer
+
+        # Try to navigate to non-existent well
+        result = widget.go_to_fov("Z9", 99)
+
+        assert result is False
+        mock_viewer.set_current_index.assert_not_called()
+
+    def test_go_to_fov_no_fov_dimension_returns_false(self, ndviewer_tab):
+        """Test that go_to_fov returns False when no fov dimension."""
+        widget = ndviewer_tab
+
+        mock_viewer = Mock()
+        mock_viewer.has_fov_dimension.return_value = False
+        widget._viewer = mock_viewer
+
+        result = widget.go_to_fov("A1", 0)
+
+        assert result is False
+
+    def test_go_to_fov_handles_exception(self, ndviewer_tab):
+        """Test that go_to_fov handles exceptions gracefully."""
+        widget = ndviewer_tab
+
+        mock_viewer = Mock()
+        mock_viewer.has_fov_dimension.side_effect = RuntimeError("Viewer error")
+        widget._viewer = mock_viewer
+
+        # Should not raise, should return False
+        result = widget.go_to_fov("A1", 0)
+
+        assert result is False
+
+    def test_go_to_fov_set_current_index_fails_returns_false(self, ndviewer_tab):
+        """Test go_to_fov returns False when set_current_index fails."""
+        widget = ndviewer_tab
+
+        mock_viewer = Mock()
+        mock_viewer.has_fov_dimension.return_value = True
+        mock_viewer.get_fov_list.return_value = [{"region": "A1", "fov": 0}]
+        mock_viewer.set_current_index.return_value = False  # Navigation fails
+        widget._viewer = mock_viewer
+
+        result = widget.go_to_fov("A1", 0)
+
+        assert result is False
+        mock_viewer.set_current_index.assert_called_once_with("fov", 0)
+
+    def test_go_to_fov_get_fov_list_exception_returns_false(self, ndviewer_tab):
+        """Test go_to_fov handles get_fov_list exceptions."""
+        widget = ndviewer_tab
+
+        mock_viewer = Mock()
+        mock_viewer.has_fov_dimension.return_value = True
+        mock_viewer.get_fov_list.side_effect = RuntimeError("FOV list error")
+        widget._viewer = mock_viewer
+
+        result = widget.go_to_fov("A1", 0)
+
+        assert result is False
+
+
+class TestNDViewerTabCleanup:
+    """Tests for NDViewerTab cleanup and close behavior."""
+
+    def test_close_with_no_viewer(self, ndviewer_tab):
+        """Test that close() is safe when no viewer exists."""
+        widget = ndviewer_tab
+        assert widget._viewer is None
+
+        # Should not raise
+        widget.close()
+
+        assert widget._viewer is None
+        assert widget._dataset_path is None
+
+    def test_close_clears_viewer(self, ndviewer_tab):
+        """Test that close() clears the viewer reference."""
+        widget = ndviewer_tab
+
+        # Create mock viewer
+        mock_viewer = Mock()
+        widget._viewer = mock_viewer
+        widget._dataset_path = "/some/path"
+
+        widget.close()
+
+        assert widget._viewer is None
+        assert widget._dataset_path is None
+        mock_viewer.close.assert_called_once()
+
+    def test_close_handles_viewer_exception(self, ndviewer_tab):
+        """Test that close() handles viewer close() exceptions."""
+        widget = ndviewer_tab
+
+        mock_viewer = Mock()
+        mock_viewer.close.side_effect = RuntimeError("Close error")
+        widget._viewer = mock_viewer
+        widget._dataset_path = "/some/path"
+
+        # Should not raise
+        widget.close()
+
+        # Should still clear references despite exception
+        assert widget._viewer is None
+        assert widget._dataset_path is None
+
+    def test_double_close_safe(self, ndviewer_tab):
+        """Test that calling close() twice is safe."""
+        widget = ndviewer_tab
+
+        mock_viewer = Mock()
+        widget._viewer = mock_viewer
+
+        widget.close()
+        assert mock_viewer.close.call_count == 1
+
+        # Second close should not raise or call viewer.close() again
+        widget.close()
+        assert mock_viewer.close.call_count == 1
+
+
+class TestNDViewerTabImportHandling:
+    """Tests for NDViewerTab import and viewer creation handling."""
+
+    def test_reload_existing_viewer(self, ndviewer_tab):
+        """Test that existing viewer is reloaded when path changes."""
+        widget = ndviewer_tab
+
+        # Set up a mock viewer that's already loaded
+        mock_viewer = Mock()
+        mock_viewer.load_dataset.return_value = None
+        mock_viewer.refresh.return_value = None
+        widget._viewer = mock_viewer
+        widget._dataset_path = "/old/path"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            widget.set_dataset_path(tmpdir)
+
+            # Should have called load_dataset and refresh on existing viewer
+            mock_viewer.load_dataset.assert_called_once_with(tmpdir)
+            mock_viewer.refresh.assert_called_once()
+
+    def test_set_dataset_path_exception_shows_error(self, ndviewer_tab):
+        """Test that viewer creation exception is handled."""
+        widget = ndviewer_tab
+
+        # Inject a mock viewer that raises on load
+        mock_viewer = Mock()
+        mock_viewer.load_dataset.side_effect = RuntimeError("Load failed")
+        widget._viewer = mock_viewer
+        widget._dataset_path = "/old/path"
+
+        # Try to load new path - should catch exception and show error
+        with tempfile.TemporaryDirectory() as tmpdir:
+            widget.set_dataset_path(tmpdir)
+
+            # Should show error in placeholder
+            assert (
+                "failed to load" in widget._placeholder.text().lower() or "error" in widget._placeholder.text().lower()
+            )

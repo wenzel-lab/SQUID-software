@@ -16,7 +16,7 @@ from control.core.scan_coordinates import (
 os.environ["QT_API"] = "pyqt5"
 import serial
 import time
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
 import numpy as np
 
 # qt libraries
@@ -28,10 +28,7 @@ from control._def import *
 
 # app specific libraries
 from control.NL5Widget import NL5Widget
-from control.core.channel_configuration_mananger import ChannelConfigurationManager
-from control.core.configuration_mananger import ConfigurationManager
 from control.core.contrast_manager import ContrastManager
-from control.core.laser_af_settings_manager import LaserAFSettingManager
 from control.core.live_controller import LiveController
 from control.core.multi_point_controller import MultiPointController
 from control.core.multi_point_utils import (
@@ -47,13 +44,14 @@ from control.core.stream_handler import StreamHandler
 from control.lighting import LightSourceType, IntensityControlMode, ShutterControlMode, IlluminationController
 from control.microcontroller import Microcontroller
 from control.microscope import Microscope
-from control.utils_config import ChannelMode
+from control.models import AcquisitionChannel
 from squid.abc import AbstractCamera, AbstractStage, AbstractFilterWheelController
 import control.lighting
 import control.microscope
 import control.widgets as widgets
 import pyqtgraph.dockarea as dock
 import squid.abc
+import squid.camera.settings_cache
 import squid.camera.utils
 import squid.config
 import squid.logging
@@ -176,7 +174,7 @@ class QtMultiPointController(MultiPointController, QObject):
     signal_acquisition_start = Signal()
     image_to_display = Signal(np.ndarray)
     image_to_display_multi = Signal(np.ndarray, int)
-    signal_current_configuration = Signal(ChannelMode)
+    signal_current_configuration = Signal(AcquisitionChannel)
     signal_register_current_fov = Signal(float, float)
     napari_layers_init = Signal(int, int, object)
     napari_layers_update = Signal(np.ndarray, float, float, int, str)  # image, x_mm, y_mm, k, channel
@@ -194,10 +192,10 @@ class QtMultiPointController(MultiPointController, QObject):
         live_controller: LiveController,
         autofocus_controller: AutoFocusController,
         objective_store: ObjectiveStore,
-        channel_configuration_mananger: ChannelConfigurationManager,
         scan_coordinates: Optional[ScanCoordinates] = None,
         laser_autofocus_controller: Optional[LaserAutofocusController] = None,
         fluidics: Optional[Any] = None,
+        alignment_widget=None,
     ):
         MultiPointController.__init__(
             self,
@@ -205,7 +203,6 @@ class QtMultiPointController(MultiPointController, QObject):
             live_controller=live_controller,
             autofocus_controller=autofocus_controller,
             objective_store=objective_store,
-            channel_configuration_mananger=channel_configuration_mananger,
             callbacks=MultiPointControllerFunctions(
                 signal_acquisition_start=self._signal_acquisition_start_fn,
                 signal_acquisition_finished=self._signal_acquisition_finished_fn,
@@ -219,6 +216,7 @@ class QtMultiPointController(MultiPointController, QObject):
             ),
             scan_coordinates=scan_coordinates,
             laser_autofocus_controller=laser_autofocus_controller,
+            alignment_widget=alignment_widget,
         )
         QObject.__init__(self)
 
@@ -240,7 +238,10 @@ class QtMultiPointController(MultiPointController, QObject):
 
     def _signal_new_image_fn(self, frame: squid.abc.CameraFrame, info: CaptureInfo):
         self.image_to_display.emit(frame.frame)
-        self.image_to_display_multi.emit(frame.frame, info.configuration.illumination_source)
+        if not USE_NAPARI_FOR_MULTIPOINT:
+            ill_config = self.microscope.config_repo.get_illumination_config()
+            source_code = info.configuration.get_illumination_source_code(ill_config) if ill_config else 0
+            self.image_to_display_multi.emit(frame.frame, source_code)
         # Z for plot in μm: piezo-only uses piezo position, mixed mode combines stepper + piezo
         stepper_z_um = info.position.z_mm * 1000
         if IS_PIEZO_ONLY:
@@ -261,8 +262,8 @@ class QtMultiPointController(MultiPointController, QObject):
             frame.frame, info.position.x_mm, info.position.y_mm, info.z_index, napri_layer_name
         )
 
-    def _signal_current_configuration_fn(self, channel_mode: ChannelMode):
-        self.signal_current_configuration.emit(channel_mode)
+    def _signal_current_configuration_fn(self, config: AcquisitionChannel):
+        self.signal_current_configuration.emit(config)
 
     def _signal_current_fov_fn(self, x_mm: float, y_mm: float):
         self.signal_register_current_fov.emit(x_mm, y_mm)
@@ -321,9 +322,6 @@ class HighContentScreeningGui(QMainWindow):
         self.fluidics: Optional[Fluidics] = microscope.addons.fluidics
         self.piezo: Optional[PiezoStage] = microscope.addons.piezo_stage
 
-        self.channelConfigurationManager: ChannelConfigurationManager = microscope.channel_configuration_mananger
-        self.laserAFSettingManager: LaserAFSettingManager = microscope.laser_af_settings_manager
-        self.configurationManager: ConfigurationManager = microscope.configuration_mananger
         self.contrastManager: ContrastManager = microscope.contrast_manager
         self.liveController: LiveController = microscope.live_controller
         self.objectiveStore: ObjectiveStore = microscope.objective_store
@@ -350,7 +348,6 @@ class HighContentScreeningGui(QMainWindow):
                 self.stage,
                 self.piezo,
                 self.objectiveStore,
-                self.laserAFSettingManager,
             )
 
         self.live_only_mode = live_only_mode or LIVE_ONLY_MODE
@@ -405,11 +402,14 @@ class HighContentScreeningGui(QMainWindow):
         self.sampleSettingsWidget: Optional[widgets.SampleSettingsWidget] = None
         self.trackingControlWidget: Optional[widgets.TrackingControllerWidget] = None
         self.napariLiveWidget: Optional[widgets.NapariLiveWidget] = None
+        self.alignmentWidget: Optional[widgets.AlignmentWidget] = None
         self.imageDisplayWindow: Optional[core.ImageDisplayWindow] = None
         self.imageDisplayWindow_focus: Optional[core.ImageDisplayWindow] = None
         self.napariMultiChannelWidget: Optional[widgets.NapariMultiChannelWidget] = None
         self.imageArrayDisplayWindow: Optional[core.ImageArrayDisplayWindow] = None
         self.zPlotWidget: Optional[widgets.SurfacePlotWidget] = None
+        self.ramMonitorWidget: Optional[widgets.RAMMonitorWidget] = None
+        self.backpressureMonitorWidget: Optional[widgets.BackpressureMonitorWidget] = None
 
         self.recordTabWidget: QTabWidget = QTabWidget()
         self.cameraTabWidget: QTabWidget = QTabWidget()
@@ -460,16 +460,13 @@ class HighContentScreeningGui(QMainWindow):
             led_matrix_action.triggered.connect(self.openLedMatrixSettings)
             settings_menu.addAction(led_matrix_action)
 
-        # Channel Configuration menu items
-        channel_config_action = QAction("Channel Configuration", self)
-        channel_config_action.triggered.connect(self.openChannelConfigurationEditor)
-        settings_menu.addAction(channel_config_action)
-
         # Advanced submenu
         advanced_menu = settings_menu.addMenu("Advanced")
-        channel_mapping_action = QAction("Channel Hardware Mapping", self)
-        channel_mapping_action.triggered.connect(self.openAdvancedChannelMapping)
-        advanced_menu.addAction(channel_mapping_action)
+
+        # Illumination Channel Configuration (in Advanced menu)
+        channel_config_action = QAction("Illumination Channel Configuration", self)
+        channel_config_action.triggered.connect(self.openChannelConfigurationEditor)
+        advanced_menu.addAction(channel_config_action)
 
         if USE_JUPYTER_CONSOLE:
             # Create namespace to expose to Jupyter
@@ -494,7 +491,6 @@ class HighContentScreeningGui(QMainWindow):
                 self.microcontroller,
                 self.stage,
                 self.objectiveStore,
-                self.channelConfigurationManager,
                 self.liveController,
                 self.autofocusController,
                 self.imageDisplayWindow,
@@ -525,7 +521,6 @@ class HighContentScreeningGui(QMainWindow):
             self.liveController,
             self.autofocusController,
             self.objectiveStore,
-            self.channelConfigurationManager,
             scan_coordinates=self.scanCoordinates,
             laser_autofocus_controller=self.laserAutofocusController,
             fluidics=self.fluidics,
@@ -623,12 +618,14 @@ class HighContentScreeningGui(QMainWindow):
                 include_camera_temperature_setting=False,
                 include_camera_auto_wb_setting=True,
             )
-        self.profileWidget = widgets.ProfileWidget(self.configurationManager)
+
+        self._restore_cached_camera_settings()
+
+        self.profileWidget = widgets.ProfileWidget(self.microscope.config_repo)
         self.liveControlWidget = widgets.LiveControlWidget(
             self.streamHandler,
             self.liveController,
             self.objectiveStore,
-            self.channelConfigurationManager,
             show_display_options=False,
             show_autolevel=True,
             autolevel=True,
@@ -712,12 +709,15 @@ class HighContentScreeningGui(QMainWindow):
         else:
             self.setupImageDisplayTabs()
 
+        # Setup alignment widget if using napari for live view
+        if USE_NAPARI_FOR_LIVE_VIEW and self.napariLiveWidget is not None:
+            self._setup_alignment_widget()
+
         self.flexibleMultiPointWidget = widgets.FlexibleMultiPointWidget(
             self.stage,
             self.navigationViewer,
             self.multipointController,
             self.objectiveStore,
-            self.channelConfigurationManager,
             self.scanCoordinates,
             self.focusMapWidget,
             self.napariMosaicDisplayWidget,
@@ -728,7 +728,6 @@ class HighContentScreeningGui(QMainWindow):
             self.multipointController,
             self.liveController,
             self.objectiveStore,
-            self.channelConfigurationManager,
             self.scanCoordinates,
             self.focusMapWidget,
             self.napariMosaicDisplayWidget,
@@ -741,7 +740,6 @@ class HighContentScreeningGui(QMainWindow):
                 self.navigationViewer,
                 self.multipointController,
                 self.objectiveStore,
-                self.channelConfigurationManager,
                 self.scanCoordinates,
                 self.focusMapWidget,
             )
@@ -750,9 +748,7 @@ class HighContentScreeningGui(QMainWindow):
             self.navigationViewer,
             self.multipointController,
             self.objectiveStore,
-            self.channelConfigurationManager,
             self.scanCoordinates,
-            self.focusMapWidget,
             self.napariMosaicDisplayWidget,
         )
         self.sampleSettingsWidget = widgets.SampleSettingsWidget(self.objectivesWidget, self.wellplateFormatWidget)
@@ -761,12 +757,79 @@ class HighContentScreeningGui(QMainWindow):
             self.trackingControlWidget = widgets.TrackingControllerWidget(
                 self.trackingController,
                 self.objectiveStore,
-                self.channelConfigurationManager,
                 show_configurations=TRACKING_SHOW_MICROSCOPE_CONFIGURATIONS,
             )
 
         self.setupRecordTabWidget()
         self.setupCameraTabWidget()
+
+    def _restore_cached_camera_settings(self) -> None:
+        """Restore cached camera settings from disk and update UI widgets.
+
+        Applies both hardware settings (via camera API) and synchronizes the UI
+        dropdown widgets. Silently returns if no cached settings exist.
+        Errors are logged but do not prevent application startup.
+        """
+        cached_settings = squid.camera.settings_cache.load_camera_settings()
+        if not cached_settings:
+            return
+
+        binning_restored = self._restore_binning(cached_settings.binning)
+        pixel_format_restored = self._restore_pixel_format(cached_settings.pixel_format)
+
+        if binning_restored or pixel_format_restored:
+            self.log.info(
+                f"Restored camera settings: binning={cached_settings.binning}, "
+                f"pixel_format={cached_settings.pixel_format}"
+            )
+
+    def _restore_binning(self, binning: Tuple[int, int]) -> bool:
+        """Apply binning setting to camera and sync UI dropdown.
+
+        Returns True if successfully applied, False otherwise.
+        """
+        try:
+            self.camera.set_binning(*binning)
+        except ValueError as e:
+            self.log.warning(f"Cannot restore binning {binning} - not supported by camera: {e}")
+            return False
+        except (AttributeError, RuntimeError) as e:
+            self.log.error(f"Camera error while restoring binning settings: {e}")
+            return False
+
+        binning_text = f"{binning[0]}x{binning[1]}"
+        self.cameraSettingWidget.dropdown_binning.blockSignals(True)
+        self.cameraSettingWidget.dropdown_binning.setCurrentText(binning_text)
+        self.cameraSettingWidget.dropdown_binning.blockSignals(False)
+        return True
+
+    def _restore_pixel_format(self, pixel_format_str: Optional[str]) -> bool:
+        """Apply pixel format setting to camera and sync UI dropdown.
+
+        Returns True if successfully applied, False otherwise.
+        """
+        if not pixel_format_str:
+            return False
+
+        try:
+            pixel_format = squid.config.CameraPixelFormat.from_string(pixel_format_str)
+        except KeyError:
+            self.log.warning(f"Cached pixel format '{pixel_format_str}' is not recognized")
+            return False
+
+        try:
+            self.camera.set_pixel_format(pixel_format)
+        except ValueError as e:
+            self.log.warning(f"Cannot restore pixel format {pixel_format_str} - not supported by this camera: {e}")
+            return False
+        except (AttributeError, RuntimeError) as e:
+            self.log.error(f"Camera error while restoring pixel format settings: {e}")
+            return False
+
+        self.cameraSettingWidget.dropdown_pixelFormat.blockSignals(True)
+        self.cameraSettingWidget.dropdown_pixelFormat.setCurrentText(pixel_format_str)
+        self.cameraSettingWidget.dropdown_pixelFormat.blockSignals(False)
+        return True
 
     def setupImageDisplayTabs(self):
         if USE_NAPARI_FOR_LIVE_VIEW:
@@ -775,7 +838,6 @@ class HighContentScreeningGui(QMainWindow):
                 self.liveController,
                 self.stage,
                 self.objectiveStore,
-                self.channelConfigurationManager,
                 self.contrastManager,
                 self.wellSelectionWidget,
             )
@@ -812,6 +874,28 @@ class HighContentScreeningGui(QMainWindow):
             if DISPLAY_PLATE_VIEW:
                 self.napariPlateViewWidget = widgets.NapariPlateViewWidget(self.contrastManager)
                 self.imageDisplayTabs.addTab(self.napariPlateViewWidget, "Plate View")
+
+            # Embedded NDViewer (lightweight) - initialized AFTER napari widgets because
+            # NDV and napari both use vispy for OpenGL rendering. Initializing NDV first
+            # can cause OpenGL context conflicts since both libraries share vispy state.
+            self.ndviewerTab = None
+            try:
+                self.ndviewerTab = widgets.NDViewerTab()
+                self.imageDisplayTabs.addTab(self.ndviewerTab, "NDViewer")
+            except ImportError:
+                self.log.warning("NDViewer tab unavailable: ndviewer_light module not installed")
+            except (RuntimeError, OSError) as e:
+                self.log.exception(f"Failed to initialize NDViewer tab due to system error: {e}")
+            except Exception:
+                self.log.exception("Failed to initialize NDViewer tab - unexpected error")
+
+            # Connect plate view double-click to NDViewer navigation and tab switch
+            if self.napariPlateViewWidget is not None and self.ndviewerTab is not None:
+                self.napariPlateViewWidget.signal_well_fov_clicked.connect(self._on_plate_view_fov_clicked)
+            elif self.napariPlateViewWidget is None:
+                self.log.debug("Plate view not available, FOV click navigation disabled")
+            elif self.ndviewerTab is None:
+                self.log.debug("NDViewer tab not available, FOV click navigation disabled")
 
             # z plot
             self.zPlotWidget = widgets.SurfacePlotWidget()
@@ -881,6 +965,38 @@ class HighContentScreeningGui(QMainWindow):
         self.recordTabWidget.currentChanged.connect(lambda: self.resizeCurrentTab(self.recordTabWidget))
         self.resizeCurrentTab(self.recordTabWidget)
 
+    def _setup_alignment_widget(self):
+        """Setup alignment widget and connect to navigation viewer and multipoint controller."""
+        if self.napariLiveWidget is None:
+            self.log.warning("Cannot setup alignment widget: napariLiveWidget not available")
+            return
+
+        self.alignmentWidget = widgets.AlignmentWidget(
+            napari_viewer=self.napariLiveWidget.viewer,
+            parent=None,
+        )
+
+        self.alignmentWidget.signal_move_to_position.connect(self._alignment_move_to)
+        self.alignmentWidget.signal_request_current_position.connect(self._alignment_provide_position)
+        self.alignmentWidget.signal_offset_set.connect(
+            lambda x, y: self.log.info(f"Alignment offset active: ({x:.4f}, {y:.4f})mm")
+        )
+        self.alignmentWidget.signal_offset_cleared.connect(lambda: self.log.info("Alignment offset cleared"))
+
+        self.multipointController.set_alignment_widget(self.alignmentWidget)
+        self.navigationViewer.set_alignment_widget(self.alignmentWidget)
+        self.log.info("Alignment widget setup complete")
+
+    def _alignment_move_to(self, x_mm: float, y_mm: float):
+        """Handle alignment widget request to move stage."""
+        self.stage.move_x_to(x_mm)
+        self.stage.move_y_to(y_mm)
+
+    def _alignment_provide_position(self):
+        """Provide current stage position to alignment widget."""
+        pos = self.stage.get_pos()
+        self.alignmentWidget.set_current_position(pos.x_mm, pos.y_mm)
+
     def setupCameraTabWidget(self):
         if not USE_NAPARI_FOR_LIVE_CONTROL or self.live_only_mode:
             self.cameraTabWidget.addTab(self.navigationWidget, "Stages")
@@ -900,8 +1016,29 @@ class HighContentScreeningGui(QMainWindow):
         self.cameraTabWidget.currentChanged.connect(lambda: self.resizeCurrentTab(self.cameraTabWidget))
         self.resizeCurrentTab(self.cameraTabWidget)
 
+        # RAM monitor widget (always create, visibility controlled by setting)
+        self.ramMonitorWidget = widgets.RAMMonitorWidget()
+        self.ramMonitorWidget.setVisible(False)
+        self._ram_monitor_should_show = False
+
+        # Backpressure monitor widget (always create, visibility controlled during acquisition)
+        self.backpressureMonitorWidget = widgets.BackpressureMonitorWidget()
+        self.backpressureMonitorWidget.setVisible(False)
+        self._bp_monitor_should_show = False
+
     def setup_layout(self):
         layout = QVBoxLayout()
+
+        # Add warning banner if simulated disk I/O mode is enabled
+        import control._def
+
+        if control._def.SIMULATED_DISK_IO_ENABLED:
+            simulated_io_banner = QLabel("  SIMULATED DISK I/O - Images are encoded but NOT saved to disk  ")
+            simulated_io_banner.setStyleSheet(
+                "background-color: #FF6B6B; color: white; font-weight: bold; padding: 8px;"
+            )
+            simulated_io_banner.setAlignment(Qt.AlignCenter)
+            layout.addWidget(simulated_io_banner)
 
         if USE_NAPARI_FOR_LIVE_CONTROL and not self.live_only_mode:
             layout.addWidget(self.navigationWidget)
@@ -948,6 +1085,17 @@ class HighContentScreeningGui(QMainWindow):
             self.setupSingleWindowLayout()
         else:
             self.setupMultiWindowLayout()
+
+        # Add RAM monitor widget to left side of status bar
+        # Status bar is hidden when RAM monitoring is disabled
+        # Visibility update is deferred to showEvent since status bar isn't visible until window is shown
+        if self.ramMonitorWidget is not None:
+            self.statusBar().addWidget(self.ramMonitorWidget)  # Left-aligned
+
+        # Add backpressure monitor widget to status bar (next to RAM monitor)
+        # Only visible during acquisition when throttling is enabled
+        if self.backpressureMonitorWidget is not None:
+            self.statusBar().addWidget(self.backpressureMonitorWidget)  # Left-aligned
 
     def _getMainWindowMinimumSize(self):
         """
@@ -1038,6 +1186,14 @@ class HighContentScreeningGui(QMainWindow):
         if self.piezoWidget:
             self.movement_updater.piezo_z_um.connect(self.piezoWidget.update_displacement_um_display)
         self.multipointController.signal_set_display_tabs.connect(self.setAcquisitionDisplayTabs)
+
+        # RAM monitor widget connections - use controller signals which fire AFTER memory monitor is created
+        self.multipointController.signal_acquisition_start.connect(self._connect_ram_monitor_widget)
+        self.multipointController.acquisition_finished.connect(self._disconnect_ram_monitor_widget)
+
+        # Backpressure monitor widget connections - fires AFTER worker is created
+        self.multipointController.signal_acquisition_start.connect(self._connect_backpressure_monitor_widget)
+        self.multipointController.acquisition_finished.connect(self._disconnect_backpressure_monitor_widget)
 
         self.recordTabWidget.currentChanged.connect(self.onTabChanged)
         if not self.live_only_mode:
@@ -1147,7 +1303,7 @@ class HighContentScreeningGui(QMainWindow):
 
         if ENABLE_SPINNING_DISK_CONFOCAL:
             self.spinningDiskConfocalWidget.signal_toggle_confocal_widefield.connect(
-                self.channelConfigurationManager.toggle_confocal_widefield
+                self.liveController.toggle_confocal_widefield
             )
             self.spinningDiskConfocalWidget.signal_toggle_confocal_widefield.connect(
                 lambda: self.liveControlWidget.select_new_microscope_mode_by_name(
@@ -1156,7 +1312,7 @@ class HighContentScreeningGui(QMainWindow):
             )
             # INITIALIZATION ORDER: Confocal state sync happens in Microscope.__init__ BEFORE
             # this GUI code runs. The microscope queries hardware state and calls
-            # channel_configuration_mananger.sync_confocal_mode_from_hardware() during init.
+            # live_controller.sync_confocal_mode_from_hardware() during init.
             # The signal connection above handles subsequent user-initiated toggles only.
             # See Microscope._sync_confocal_mode_from_hardware() for the initial sync logic.
 
@@ -1442,19 +1598,23 @@ class HighContentScreeningGui(QMainWindow):
             config = ConfigParser()
             config.read(CACHED_CONFIG_FILE_PATH)
             dialog = widgets.PreferencesDialog(config, CACHED_CONFIG_FILE_PATH, self)
+            dialog.signal_config_changed.connect(self._update_ram_monitor_visibility)
             dialog.exec_()
         else:
             self.log.warning("No configuration file found")
 
     def openChannelConfigurationEditor(self):
-        """Open the channel configuration editor dialog"""
-        dialog = widgets.ChannelEditorDialog(self.channelConfigurationManager, self)
+        """Open the illumination channel configurator dialog"""
+        from control.core.config import ConfigRepository
+
+        config_repo = ConfigRepository()
+        dialog = widgets.IlluminationChannelConfiguratorDialog(config_repo, self)
         dialog.signal_channels_updated.connect(self._refresh_channel_lists)
         dialog.exec_()
 
     def openAdvancedChannelMapping(self):
         """Open the advanced channel hardware mapping dialog"""
-        dialog = widgets.AdvancedChannelMappingDialog(self.channelConfigurationManager, self)
+        dialog = widgets.AdvancedChannelMappingDialog(self.microscope.config_repo, self)
         dialog.signal_mappings_updated.connect(self._refresh_channel_lists)
         dialog.exec_()
 
@@ -1628,16 +1788,20 @@ class HighContentScreeningGui(QMainWindow):
         self.log.debug(f"toggleAcquisitionStarted({acquisition_started=})")
         if acquisition_started:
             self.log.info("STARTING ACQUISITION")
+            self._update_ndviewer_for_acquisition()
             if self.is_live_scan_grid_on:
                 self.toggle_live_scan_grid(on=False)
                 self.live_scan_grid_was_on = True
             else:
                 self.live_scan_grid_was_on = False
+            # NOTE: RAM monitor widget is connected via multipointController.signal_acquisition_start
+            # which fires AFTER the memory monitor is created (see make_connections)
         else:
             self.log.info("FINISHED ACQUISITION")
             if self.live_scan_grid_was_on:
                 self.toggle_live_scan_grid(on=True)
                 self.live_scan_grid_was_on = False
+            # NOTE: RAM monitor widget is disconnected via multipointController.acquisition_finished
 
         # click to move off during acquisition
         self.navigationWidget.set_click_to_move(not acquisition_started)
@@ -1665,8 +1829,104 @@ class HighContentScreeningGui(QMainWindow):
         # display acquisition progress bar during acquisition
         self.recordTabWidget.currentWidget().display_progress_bar(acquisition_started)
 
+    def _update_ram_monitor_visibility(self):
+        """Update RAM monitor widget visibility based on setting."""
+        import control._def
+
+        if self.ramMonitorWidget is None:
+            return
+
+        if control._def.ENABLE_MEMORY_PROFILING:
+            self._ram_monitor_should_show = True
+            self.ramMonitorWidget.setVisible(True)
+            self.ramMonitorWidget.start_monitoring()
+            self.log.info("RAM monitor: enabled, showing widget")
+        else:
+            self._ram_monitor_should_show = False
+            self.ramMonitorWidget.stop_monitoring()
+            self.ramMonitorWidget.setVisible(False)
+            self.log.debug("RAM monitor: disabled, hiding widget")
+
+        self._update_status_bar_visibility()
+
+    def _update_status_bar_visibility(self):
+        """Show or hide status bar based on whether any monitor widgets should be visible."""
+        self.statusBar().setVisible(self._ram_monitor_should_show or self._bp_monitor_should_show)
+
+    def _connect_ram_monitor_widget(self):
+        """Connect RAM monitor widget to memory monitor during acquisition."""
+        import control._def
+
+        if not control._def.ENABLE_MEMORY_PROFILING:
+            return
+
+        if self.ramMonitorWidget is None:
+            return
+
+        # Connect to the memory monitor from the multipointController for more detailed acquisition tracking
+        if self.multipointController is not None and self.multipointController._memory_monitor is not None:
+            self.log.info("RAM monitor: connecting widget to memory monitor for acquisition")
+            self.ramMonitorWidget.connect_monitor(self.multipointController._memory_monitor)
+
+    def _disconnect_ram_monitor_widget(self):
+        """Disconnect RAM monitor widget from acquisition memory monitor."""
+        import control._def
+
+        if self.ramMonitorWidget is not None:
+            self.ramMonitorWidget.disconnect_monitor()
+            # Control monitoring based on current profiling setting
+            if control._def.ENABLE_MEMORY_PROFILING:
+                # Resume background monitoring, preserve peak from acquisition
+                self.ramMonitorWidget.start_monitoring(reset_peak=False)
+                self.log.debug("RAM monitor: disconnected from acquisition, continuing background monitoring")
+            else:
+                # Stop monitoring entirely when profiling is disabled
+                self.ramMonitorWidget.stop_monitoring()
+                self.log.debug("RAM monitor: disconnected from acquisition, monitoring stopped (profiling disabled)")
+
+    def _connect_backpressure_monitor_widget(self):
+        """Connect backpressure monitor widget during acquisition."""
+        import control._def
+
+        if not control._def.ACQUISITION_THROTTLING_ENABLED:
+            self.log.debug("Backpressure monitor: throttling disabled, skipping")
+            return
+
+        if self.backpressureMonitorWidget is None:
+            self.log.warning("Backpressure monitor: widget not initialized")
+            return
+
+        # Get the backpressure controller from the multipoint worker
+        bp_controller = self.multipointController.backpressure_controller
+        if bp_controller is None:
+            self.log.debug("Backpressure monitor: no controller available from worker")
+            return
+
+        if not bp_controller.enabled:
+            self.log.debug("Backpressure monitor: controller exists but is disabled")
+            return
+
+        self.log.info("Backpressure monitor: connecting widget to backpressure controller")
+        self._bp_monitor_should_show = True
+        self.backpressureMonitorWidget.start_monitoring(bp_controller)
+        self.backpressureMonitorWidget.setVisible(True)
+        self._update_status_bar_visibility()
+
+    def _disconnect_backpressure_monitor_widget(self):
+        """Disconnect backpressure monitor widget after acquisition."""
+        if self.backpressureMonitorWidget is None:
+            return
+
+        self._bp_monitor_should_show = False
+        self.backpressureMonitorWidget.stop_monitoring()
+        self.backpressureMonitorWidget.setVisible(False)
+        self.log.debug("Backpressure monitor: disconnected from acquisition")
+        self._update_status_bar_visibility()
+
     def onStartLive(self):
         self.imageDisplayTabs.setCurrentIndex(0)
+        if self.alignmentWidget is not None:
+            self.alignmentWidget.enable()
 
     def move_from_click_image(self, click_x, click_y, image_width, image_height):
         if self.navigationWidget.get_click_to_move_enabled():
@@ -1697,6 +1957,50 @@ class HighContentScreeningGui(QMainWindow):
         self.stage.move_x_to(x_mm)
         self.stage.move_y_to(y_mm)
 
+    def showEvent(self, event):
+        """Handle window show event to initialize visibility-dependent widgets."""
+        super().showEvent(event)
+        # Initialize RAM monitor visibility now that window is shown
+        if hasattr(self, "_ram_monitor_initialized") and self._ram_monitor_initialized:
+            return  # Only initialize once
+        self._ram_monitor_initialized = True
+        self._update_ram_monitor_visibility()
+
+    def _update_ndviewer_for_acquisition(self) -> None:
+        """Update NDViewer tab to point at the current acquisition folder."""
+        if self.ndviewerTab is None:
+            self.log.debug("_update_ndviewer_for_acquisition: ndviewerTab is None")
+            return
+
+        try:
+            base_path = getattr(self.multipointController, "base_path", None)
+            experiment_id = getattr(self.multipointController, "experiment_ID", None)
+            self.log.debug(f"_update_ndviewer_for_acquisition: base_path={base_path}, experiment_id={experiment_id}")
+            if base_path and experiment_id:
+                dataset_path = os.path.join(base_path, experiment_id)
+                self.log.debug(f"Setting NDViewer dataset path to: {dataset_path}")
+                self.ndviewerTab.set_dataset_path(dataset_path)
+            else:
+                self.log.debug("_update_ndviewer_for_acquisition: base_path or experiment_id not set")
+        except Exception:
+            self.log.exception("Failed to update NDViewer tab for new acquisition")
+
+    def _on_plate_view_fov_clicked(self, well_id: str, fov_index: int) -> None:
+        """Handle double-click on plate view: navigate NDViewer to FOV and switch tab."""
+        if self.ndviewerTab is None:
+            self.log.debug("FOV click ignored: NDViewer tab not available")
+            return
+
+        if not self.ndviewerTab.go_to_fov(well_id, fov_index):
+            self.log.debug(f"Could not navigate to FOV well={well_id}, fov={fov_index} - may not exist in dataset")
+            return
+
+        ndviewer_tab_idx = self.imageDisplayTabs.indexOf(self.ndviewerTab)
+        if ndviewer_tab_idx >= 0:
+            self.imageDisplayTabs.setCurrentIndex(ndviewer_tab_idx)
+        else:
+            self.log.warning("NDViewer tab exists but not found in tab widget")
+
     def closeEvent(self, event):
         # Show confirmation dialog
         reply = QMessageBox.question(
@@ -1715,6 +2019,24 @@ class HighContentScreeningGui(QMainWindow):
             squid.stage.utils.cache_position(pos=self.stage.get_pos(), stage_config=self.stage.get_config())
         except ValueError as e:
             self.log.error(f"Couldn't cache position while closing.  Ignoring and continuing. Error is: {e}")
+
+        # Save camera settings (binning, pixel format)
+        squid.camera.settings_cache.save_camera_settings(self.camera)
+
+        # Clean up multipoint controller resources (queues, timers, process pools)
+        if self.multipointController is not None:
+            try:
+                self.multipointController.close()
+            except Exception:
+                self.log.exception("Error closing multipoint controller during shutdown")
+
+        # Clean up NDViewer resources (file handles, timers)
+        if self.ndviewerTab is not None:
+            try:
+                self.ndviewerTab.close()
+            except Exception:
+                self.log.exception("Error closing NDViewer tab during shutdown")
+
         self.movement_update_timer.stop()
 
         if self.emission_filter_wheel:
